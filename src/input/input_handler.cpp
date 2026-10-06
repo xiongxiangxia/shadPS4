@@ -739,9 +739,11 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         }
     };
     state_changed = old_button_state != new_button_state || old_param != *new_param;
-    PadTrace::Record("MAP_OUTPUT", {static_cast<s64>(PadTrace::CurrentEvent()), gamepad_index,
-                                    button, axis, positive_axis, old_button_state, new_button_state,
-                                    old_param, *new_param, state_changed});
+    if (state_changed || old_button_state || new_button_state || old_param || *new_param) {
+        PadTrace::Record("MAP_OUTPUT", {static_cast<s64>(PadTrace::CurrentEvent()), gamepad_index,
+                                        button, axis, positive_axis, old_button_state,
+                                        new_button_state, old_param, *new_param, state_changed});
+    }
     if (!state_changed) {
         return;
     }
@@ -1032,15 +1034,17 @@ void ActivateOutputsFromInputs() {
             // only update this when it's the correct pass
             if (it.output->gamepad_id == i) {
                 const auto event = it.ProcessBinding();
-                PadTrace::Record("BINDING",
-                                 {static_cast<s64>(PadTrace::CurrentEvent()), i, it.output->button,
-                                  it.output->axis, it.output->positive_axis, event.active,
-                                  event.axis_value, static_cast<s64>(it.binding.keys[0].type),
-                                  it.binding.keys[0].sdl_id, it.binding.keys[0].gamepad_id,
-                                  static_cast<s64>(it.binding.keys[1].type),
-                                  it.binding.keys[1].sdl_id, it.binding.keys[1].gamepad_id,
-                                  static_cast<s64>(it.binding.keys[2].type),
-                                  it.binding.keys[2].sdl_id, it.binding.keys[2].gamepad_id});
+                if (event.active || it.output->old_button_state || it.output->old_param) {
+                    PadTrace::Record(
+                        "BINDING",
+                        {static_cast<s64>(PadTrace::CurrentEvent()), i, it.output->button,
+                         it.output->axis, it.output->positive_axis, event.active, event.axis_value,
+                         static_cast<s64>(it.binding.keys[0].type), it.binding.keys[0].sdl_id,
+                         it.binding.keys[0].gamepad_id, static_cast<s64>(it.binding.keys[1].type),
+                         it.binding.keys[1].sdl_id, it.binding.keys[1].gamepad_id,
+                         static_cast<s64>(it.binding.keys[2].type), it.binding.keys[2].sdl_id,
+                         it.binding.keys[2].gamepad_id});
+                }
                 it.output->AddUpdate(event);
             }
         }

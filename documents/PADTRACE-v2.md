@@ -60,6 +60,7 @@ sequence numbers. `QUEUE_READ.p0` correlates with `READ_BEGIN.p0`.
 `Axis`: 0 left X, 1 left Y, 2 right X, 3 right Y, 4 L2, 5 R2.
 Output button/axis IDs are SDL identifiers, not Orbis bit masks. Configuration comments contain
 the effective sorted binding list and configuration paths, including reloads.
+Inactive, unchanged outputs and inactive bindings with neutral previous outputs are omitted.
 
 Orbis masks: Triangle 0x1000, Circle 0x2000, Cross 0x4000, Square 0x8000;
 L2 0x100, R2 0x200, L1 0x400, R1 0x800; intercepted 0x80000000.
