@@ -10,6 +10,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/pad_trace.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -250,6 +251,10 @@ void VideoOutDriver::Flip(const Request& req) {
         flip_status.tsc = Libraries::Kernel::sceKernelReadTsc();
         flip_status.flip_arg = req.flip_arg;
         flip_status.current_buffer = req.index;
+        Input::PadTrace::Record("FRAME_PRESENT",
+                                {static_cast<s64>(flip_status.count), req.index, req.flip_arg,
+                                 static_cast<s64>(flip_status.process_time),
+                                 static_cast<s64>(flip_status.tsc)});
         if (req.eop) {
             --flip_status.gc_queue_num;
         }
@@ -303,6 +308,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+        Input::PadTrace::Record("FRAME_QUEUE",
+                                {index, flip_arg, is_eop, port->flip_status.flip_pending_num,
+                                 static_cast<s64>(port->flip_status.submit_tsc)});
     }
 
     if (!is_eop) {
@@ -403,6 +411,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.count++;
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+            Input::PadTrace::Record("VBLANK", {static_cast<s64>(vblank_status.count),
+                                               static_cast<s64>(vblank_status.process_time),
+                                               static_cast<s64>(vblank_status.tsc)});
             main_port.vblank_cv.notify_all();
         }
 

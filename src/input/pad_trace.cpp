@@ -207,6 +207,30 @@ void Configuration(std::string_view text) {
     }
 }
 
+void ClockSample(u32 api, u64 value, u64 frequency) {
+    if (!Enabled() || api >= 3) {
+        return;
+    }
+    struct Sample {
+        u64 value = 0;
+        u64 calls = 0;
+        std::chrono::steady_clock::time_point recorded{};
+    };
+    static thread_local std::array<Sample, 3> samples;
+    auto& sample = samples[api];
+    const auto now = std::chrono::steady_clock::now();
+    const bool backwards = sample.calls != 0 && value < sample.value;
+    const u64 previous = sample.value;
+    sample.value = value;
+    ++sample.calls;
+    if (backwards || now - sample.recorded >= std::chrono::milliseconds{10}) {
+        Record("CLOCK", {api, static_cast<s64>(value), static_cast<s64>(frequency),
+                         static_cast<s64>(sample.calls), backwards, static_cast<s64>(previous),
+                         static_cast<s64>(CurrentEvent())});
+        sample.recorded = now;
+    }
+}
+
 EventScope::EventScope() : previous{current_event} {
     current_event = NextId();
 }
@@ -231,6 +255,7 @@ u64 CurrentEvent() {
 }
 void Record(const char*, std::initializer_list<s64>) {}
 void Configuration(std::string_view) {}
+void ClockSample(u32, u64, u64) {}
 EventScope::EventScope() : previous{0} {}
 EventScope::~EventScope() {}
 } // namespace Input::PadTrace

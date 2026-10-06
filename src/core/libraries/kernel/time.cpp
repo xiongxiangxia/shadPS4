@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "input/pad_trace.h"
 
 #ifdef _WIN64
 #include <windows.h>
@@ -39,11 +40,15 @@ u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
     // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
-    return clock->GetTimeUS(initial_ptc);
+    const u64 value = clock->GetTimeUS(initial_ptc);
+    Input::PadTrace::ClockSample(0, value, 1000000);
+    return value;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
-    return clock->GetUptime() - initial_ptc;
+    const u64 value = clock->GetUptime() - initial_ptc;
+    Input::PadTrace::ClockSample(1, value, clock->GetTscFrequency());
+    return value;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
@@ -51,7 +56,9 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
 }
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
-    return clock->GetUptime();
+    const u64 value = clock->GetUptime();
+    Input::PadTrace::ClockSample(2, value, clock->GetTscFrequency());
+    return value;
 }
 
 static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,

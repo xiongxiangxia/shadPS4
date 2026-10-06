@@ -16,6 +16,7 @@ u64 NextId();
 u64 CurrentEvent();
 void Record(const char* kind, std::initializer_list<s64> fields);
 void Configuration(std::string_view text);
+void ClockSample(u32 api, u64 value, u64 frequency);
 
 class EventScope {
 public:

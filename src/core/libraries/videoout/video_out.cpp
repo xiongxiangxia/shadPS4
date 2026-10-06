@@ -11,6 +11,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "input/pad_trace.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -153,6 +154,7 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
+    Input::PadTrace::Record("FLIP_SUBMIT", {handle, bufferIndex, flipMode, flipArg});
     auto* port = driver->GetPort(handle);
     if (!port) {
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);
@@ -379,7 +381,9 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
 
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
+    Input::PadTrace::Record("VBLANK_WAIT", {handle, static_cast<s64>(prev_counter)});
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
+    Input::PadTrace::Record("VBLANK_WAKE", {handle, static_cast<s64>(port->vblank_status.count)});
     return ORBIS_OK;
 }
 

@@ -1,5 +1,21 @@
 # PADTRACE v2 input diagnostic build
 
+## Frame and clock extension
+
+The extended build also records `FRAME_QUEUE` (buffer index, flip argument, EOP flag,
+pending count, submit TSC), `FRAME_PRESENT` (present count, buffer index, flip argument,
+process microseconds, TSC), `VBLANK` (count, process microseconds, TSC),
+`FLIP_SUBMIT` (handle, buffer index, mode, argument), and `VBLANK_WAIT`/`VBLANK_WAKE`
+(handle, vblank count). Presentation is not a measurement of guest animation progress.
+
+`CLOCK` fields are API (0 process microseconds, 1 process counter, 2 raw TSC), value,
+frequency, cumulative per-thread/API call count, backwards flag, previous call value,
+and current trace event ID. Each thread/API is sampled at most once per 10 ms except
+backwards values, which are always recorded. Emulator internal calls are included;
+event IDs associate scoped input/read calls, not guest code addresses. Other clock
+APIs and direct guest CPU timestamp instructions are not captured by these hooks.
+Additional timing probes add overhead and do not expose the game's internal charge state.
+
 This build records input delivery, not DmC internal charge or animation state. It does not change
 button mappings, queue consumption, sampling, or emulated pad return values. The baseline uses the
 same source with `ENABLE_PADTRACE=OFF`. The diagnostic build uses `ENABLE_PADTRACE=ON` and records
