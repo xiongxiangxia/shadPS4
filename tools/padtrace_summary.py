@@ -19,6 +19,7 @@ BUTTONS = {
 
 def summarize(path):
     counts = collections.Counter()
+    filters = collections.Counter()
     states = {}
     presses = {}
     pulses = []
@@ -65,6 +66,8 @@ def summarize(path):
             p = [int(row[f"p{i}"]) for i in range(24)]
             if kind == "RAW":
                 raw_times[p[0]] = timestamp
+            elif kind == "FILTER":
+                filters[p[1]] += 1
             elif kind == "MARKER":
                 markers.append({"event_id": p[0], "monotonic_us": timestamp})
             elif kind == "PUSH":
@@ -120,6 +123,7 @@ def summarize(path):
         "revision": revision,
         "duration_seconds": (end - start) / 1000000 if start is not None else 0,
         "events": dict(counts), "dropped_records": dropped, "limit_reached": limit_reached,
+        "routing_filters": dict(filters),
         "markers": markers, "max_sample_age_ms": max_age / 1000,
         "max_raw_to_push_ms": max_raw_to_push / 1000,
         "max_read_gap_ms_by_thread_handle": {

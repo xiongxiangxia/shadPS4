@@ -40,6 +40,9 @@ sequence numbers. `QUEUE_READ.p0` correlates with `READ_BEGIN.p0`.
 
 | kind | p0 onwards, in order |
 | --- | --- |
+| DISPATCH | event_id, SDL event type, SDL timestamp_ns, device_id, key/button/axis_id, down, raw_axis_value, keyboard_repeat; captured before routing filters |
+| FILTER | event_id, consumed_by (0 forwarded, 1 guest mouse/keyboard, 2 ImGui) |
+| WINDOW_DEVICE | event_id, SDL event type, SDL timestamp_ns; window focus and controller add/remove |
 | RAW | event_id, SDL event type, SDL timestamp_ns, InputType, input_id, gamepad_id (1-based), active, mapped_axis_value, keyboard_repeat, raw_sdl_axis_value |
 | INPUT_ACCEPT | event_id, pressed-key-list changed |
 | MAP_BEGIN | event_id, pressed-key-list size |

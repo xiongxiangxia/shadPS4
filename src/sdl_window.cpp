@@ -210,12 +210,61 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
+    Input::PadTrace::EventScope dispatch_scope;
+    const auto dispatch_id = static_cast<s64>(Input::PadTrace::CurrentEvent());
+    const bool traced_input =
+        event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP ||
+        event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+        event.type == SDL_EVENT_MOUSE_WHEEL || event.type == SDL_EVENT_MOUSE_WHEEL_OFF ||
+        event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+        event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
+    if (traced_input) {
+        const bool keyboard = event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
+        const bool button = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+                            event.type == SDL_EVENT_GAMEPAD_BUTTON_UP;
+        const bool axis = event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
+        const bool mouse_button =
+            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP;
+        Input::PadTrace::Record("DISPATCH",
+                                {dispatch_id, event.type, static_cast<s64>(event.common.timestamp),
+                                 keyboard ? event.key.which
+                                 : button ? event.gbutton.which
+                                 : axis   ? event.gaxis.which
+                                          : 0,
+                                 keyboard       ? event.key.key
+                                 : button       ? event.gbutton.button
+                                 : axis         ? event.gaxis.axis
+                                 : mouse_button ? event.button.button
+                                                : 0,
+                                 event.type == SDL_EVENT_KEY_DOWN ||
+                                     event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+                                     event.type == SDL_EVENT_MOUSE_BUTTON_DOWN,
+                                 axis ? event.gaxis.value : 0, keyboard && event.key.repeat});
+    }
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F9) {
+        Input::PadTrace::Record("MARKER", {dispatch_id});
+    }
+    if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST ||
+        event.type == SDL_EVENT_GAMEPAD_ADDED || event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+        Input::PadTrace::Record(
+            "WINDOW_DEVICE", {dispatch_id, event.type, static_cast<s64>(event.common.timestamp)});
+    }
+
     if (Libraries::Mouse::PushSDLEvent(event) || Libraries::Keyboard::PushSDLEvent(event)) {
+        if (traced_input) {
+            Input::PadTrace::Record("FILTER", {dispatch_id, 1});
+        }
         return;
     }
 
     if (ImGui::Core::ProcessEvent(&event)) {
+        if (traced_input) {
+            Input::PadTrace::Record("FILTER", {dispatch_id, 2});
+        }
         return;
+    }
+    if (traced_input) {
+        Input::PadTrace::Record("FILTER", {dispatch_id, 0});
     }
 
     switch (event.type) {
@@ -381,10 +430,6 @@ Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
 
 void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
     using Libraries::Pad::OrbisPadButtonDataOffset;
-    Input::PadTrace::EventScope trace_scope;
-    if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat && event->key.key == SDLK_F9) {
-        Input::PadTrace::Record("MARKER", {static_cast<s64>(Input::PadTrace::CurrentEvent())});
-    }
 
     // get the event's id, if it's keyup or keydown
     const bool input_down = event->type == SDL_EVENT_KEY_DOWN ||
@@ -415,7 +460,6 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 }
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
-    Input::PadTrace::EventScope trace_scope;
     bool input_down = event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ||
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);
