@@ -12,6 +12,7 @@ namespace Input::PadTrace {
 void Initialize();
 void Shutdown();
 bool Enabled();
+bool Toggle();
 u64 NextId();
 u64 CurrentEvent();
 void Record(const char* kind, std::initializer_list<s64> fields);

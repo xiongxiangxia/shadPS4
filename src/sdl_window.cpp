@@ -242,7 +242,9 @@ void WindowSDL::WaitEvent() {
                                  axis ? event.gaxis.value : 0, keyboard && event.key.repeat});
     }
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F9) {
-        Input::PadTrace::Record("MARKER", {dispatch_id});
+        if (Input::PadTrace::Toggle()) {
+            return;
+        }
     }
     if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST ||
         event.type == SDL_EVENT_GAMEPAD_ADDED || event.type == SDL_EVENT_GAMEPAD_REMOVED) {

@@ -64,7 +64,13 @@ def summarize(path):
             start = timestamp if start is None else min(start, timestamp)
             end = timestamp if end is None else max(end, timestamp)
             p = [int(row[f"p{i}"]) for i in range(24)]
-            if kind == "RAW":
+            if kind == "CAPTURE":
+                presses.clear()
+                states.clear()
+                previous_read.clear()
+                raw_times.clear()
+                markers.append({"recording": bool(p[0]), "monotonic_us": timestamp})
+            elif kind == "RAW":
                 raw_times[p[0]] = timestamp
             elif kind == "FILTER":
                 filters[p[1]] += 1
@@ -72,7 +78,7 @@ def summarize(path):
                 markers.append({"event_id": p[0], "monotonic_us": timestamp})
             elif kind == "PUSH":
                 user, sample_time, buttons = p[1], p[3], p[4]
-                old = states.get(user, 0)
+                old = states.get(user, buttons)
                 for mask, name in BUTTONS.items():
                     key = (user, mask)
                     if buttons & mask and not old & mask:

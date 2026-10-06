@@ -19,21 +19,23 @@ Additional timing probes add overhead and do not expose the game's internal char
 This build records input delivery, not DmC internal charge or animation state. It does not change
 button mappings, queue consumption, sampling, or emulated pad return values. The baseline uses the
 same source with `ENABLE_PADTRACE=OFF`. The diagnostic build uses `ENABLE_PADTRACE=ON` and records
-by default. Set `SHADPS4_PADTRACE=0` before starting it to disable recording at runtime.
+only after pressing F9. Press F9 again to stop; repeat to capture another segment in the same CSV.
+Set `SHADPS4_PADTRACE=1` to start recording immediately, or `SHADPS4_PADTRACE=0` to disable
+the recorder entirely. The switch controls PADTRACE CSV only, not ordinary emulator logs.
 
 ## Installation and capture (中文)
 
 1. 复制现有模拟器目录作测试副本，备份原 `shadPS4.exe`，替换为 diagnostic 包中的同名 exe。
    这是模拟器核心，不是启动器。确认启动器所选核心路径，测试时关闭自动更新。
-2. 启动 DmC 决定版，进入可以稳定测试蓄力的场景。按 F9 为每组实验打标记。
-   F9 只增加记录，不拦截原有绑定；如已自行绑定 F9，请暂时使用其它键或不要打标记。
+2. 启动时默认不采集输入。进入测试场景后按 F9 开始记录，再按 F9 停止记录。
+   普通日志会显示 Recording ON/OFF。诊断版的 F9 按下事件用于开关，请不要绑定游戏动作。
 3. 先测试霰弹枪：只蓄力松枪；立即接平 A 后蓄力松枪；延迟接平 A 后蓄力松枪。
-   每组按 F9 后重复 3 次，组间留 2 秒。保持枪键按住的总时间尽量相同。
+   每组开始前按 F9 开启，重复 3 次并松开所有键后再按 F9 关闭。保持枪键按住的总时间尽量相同。
 4. 双枪按相同顺序测试，再单独测试狂接平 A。最后另开一次测试 Jump Cancel 吞攻击。
 5. 键盘和手柄分别录制。注明枪/近战/跳跃对应的 PS 按钮、游戏版本、输入设备以及各组成功次数。
 6. 正常退出游戏和模拟器。将最新 `padtrace-v2-*.csv` 和 `shad_log.txt` 一起发送。
    CSV 位于模拟器实际 user/log 目录：便携模式为 `user/log`，否则通常为
-   `%APPDATA%/shadPS4/log`。启动日志中的 `[PADTRACE] Recording to ...` 会显示确切路径。
+   `%APPDATA%/shadPS4/log`。启动日志中的 `[PADTRACE] Trace file ...` 会显示确切路径。
 7. 换用 baseline 包中的 exe，以相同条件确认 bug 仍然存在；该包不会生成 CSV。
 
 CSV 不受普通日志过滤器影响。记录后台每 250 ms 批量写入；输入路径仅复制数字到有界内存队列。
@@ -56,6 +58,7 @@ sequence numbers. `QUEUE_READ.p0` correlates with `READ_BEGIN.p0`.
 
 | kind | p0 onwards, in order |
 | --- | --- |
+| CAPTURE | recording (1 started, 0 stopped); incomplete holds at segment boundaries are excluded by the analyzer |
 | DISPATCH | event_id, SDL event type, SDL timestamp_ns, device_id, key/button/axis_id, down, raw_axis_value, keyboard_repeat; captured before routing filters |
 | FILTER | event_id, consumed_by (0 forwarded, 1 guest mouse/keyboard, 2 ImGui) |
 | WINDOW_DEVICE | event_id, SDL event type, SDL timestamp_ns; window focus and controller add/remove |

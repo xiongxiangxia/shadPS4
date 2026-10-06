@@ -36,6 +36,7 @@ struct Entry {
 };
 
 struct Recorder {
+    std::atomic<bool> available{false};
     std::atomic<bool> enabled{false};
     std::atomic<u64> next_id{1};
     std::mutex mutex;
@@ -77,6 +78,9 @@ void WriteLoop() {
             stopping = recorder.stopping;
         }
         std::string output;
+        if (entries.empty() && configuration.empty() && !stopping) {
+            continue;
+        }
         output.reserve(entries.size() * 180);
         for (const auto& line : configuration) {
             fmt::format_to(std::back_inserter(output), "# config={}\n", line);
@@ -94,6 +98,7 @@ void WriteLoop() {
         recorder.file.write(output.data(), static_cast<std::streamsize>(output.size()));
         recorder.file.flush();
         if (!recorder.file) {
+            recorder.available = false;
             recorder.enabled = false;
             LOG_ERROR(Input, "[PADTRACE] Trace write failed; recording disabled");
             return;
@@ -133,16 +138,19 @@ void Initialize() {
         }
         recorder.file << '\n';
         recorder.pending.reserve(buffer_capacity);
-        recorder.enabled = true;
+        recorder.available = true;
+        recorder.enabled = setting && std::string_view{setting} == "1";
         recorder.writer = std::thread{WriteLoop};
         std::atexit(Shutdown);
         std::at_quick_exit(Shutdown);
-        LOG_INFO(Input, "[PADTRACE] Recording to {}", Common::FS::PathToUTF8String(path));
+        LOG_INFO(Input, "[PADTRACE] Trace file {}; F9 toggles recording (currently {})",
+                 Common::FS::PathToUTF8String(path), recorder.enabled.load() ? "ON" : "OFF");
     });
 }
 
 void Shutdown() {
     auto& recorder = GetRecorder();
+    recorder.available = false;
     recorder.enabled = false;
     {
         std::lock_guard lock{recorder.mutex};
@@ -156,6 +164,31 @@ void Shutdown() {
 
 bool Enabled() {
     return GetRecorder().enabled.load(std::memory_order_relaxed);
+}
+
+bool Toggle() {
+    auto& recorder = GetRecorder();
+    if (!recorder.available.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const bool was_enabled = Enabled();
+    if (was_enabled) {
+        Record("CAPTURE", {0});
+    }
+    {
+        std::lock_guard lock{recorder.mutex};
+        if (recorder.stopping || recorder.sequence >= record_limit) {
+            LOG_WARNING(Input, "[PADTRACE] Recording limit reached; restart to capture again");
+            return true;
+        }
+        recorder.enabled = !was_enabled;
+    }
+    if (!was_enabled) {
+        Record("CAPTURE", {1});
+    }
+    recorder.wake.notify_one();
+    LOG_INFO(Input, "[PADTRACE] Recording {}", was_enabled ? "OFF" : "ON");
+    return true;
 }
 
 u64 NextId() {
@@ -181,7 +214,7 @@ void Record(const char* kind, std::initializer_list<s64> fields) {
     entry.thread = thread_id;
     std::copy_n(fields.begin(), std::min(fields.size(), entry.fields.size()), entry.fields.begin());
     std::lock_guard lock{recorder.mutex};
-    if (recorder.stopping) {
+    if (recorder.stopping || !recorder.enabled.load(std::memory_order_relaxed)) {
         return;
     }
     entry.sequence = ++recorder.sequence;
@@ -197,7 +230,7 @@ void Record(const char* kind, std::initializer_list<s64> fields) {
 }
 
 void Configuration(std::string_view text) {
-    if (!Enabled()) {
+    if (!GetRecorder().available.load(std::memory_order_relaxed)) {
         return;
     }
     auto& recorder = GetRecorder();
@@ -245,6 +278,9 @@ namespace Input::PadTrace {
 void Initialize() {}
 void Shutdown() {}
 bool Enabled() {
+    return false;
+}
+bool Toggle() {
     return false;
 }
 u64 NextId() {
