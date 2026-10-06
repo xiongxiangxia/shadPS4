@@ -5,11 +5,13 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
+#include "input/pad_trace.h"
 #include "pad.h"
 
 #include <algorithm>
@@ -431,17 +433,57 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
 
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     LOG_TRACE(Lib_Pad, "called");
+    const u64 caller = Input::PadTrace::CurrentEvent();
+    Input::PadTrace::EventScope trace_scope;
+    const u64 request = Input::PadTrace::CurrentEvent();
+    Input::PadTrace::Record("READ_BEGIN",
+                            {static_cast<s64>(request), handle, num, pData != nullptr,
+                             static_cast<s64>(Libraries::Kernel::sceKernelGetProcessTime()),
+                             static_cast<s64>(caller)});
     if (pData == nullptr || num < 1 || num > ORBIS_PAD_MAX_DATA_NUM) {
+        Input::PadTrace::Record(
+            "READ_END", {static_cast<s64>(request), handle, num, ORBIS_PAD_ERROR_INVALID_ARG});
         return ORBIS_PAD_ERROR_INVALID_ARG;
     }
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
+        Input::PadTrace::Record(
+            "READ_END", {static_cast<s64>(request), handle, num, ORBIS_PAD_ERROR_INVALID_HANDLE});
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
     auto& controller = *it->second;
     std::array<Input::State, ORBIS_PAD_MAX_DATA_NUM> states;
     const int ret_num = controller.ReadStates(states.data(), num);
-    return ProcessStates(pData, states.data(), ret_num);
+    const int result = ProcessStates(pData, states.data(), ret_num);
+    const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
+    for (int i = 0; i < result; ++i) {
+        const auto& source = states[i];
+        const auto& output = pData[i];
+        Input::PadTrace::Record("READ_SAMPLE", {static_cast<s64>(request),
+                                                handle,
+                                                controller.user_id,
+                                                num,
+                                                result,
+                                                i,
+                                                static_cast<s64>(source.trace_id),
+                                                static_cast<s64>(source.trace_event),
+                                                static_cast<s64>(source.time),
+                                                static_cast<s64>(now),
+                                                static_cast<u32>(source.buttonsState),
+                                                static_cast<u32>(output.buttons),
+                                                output.connected,
+                                                output.analogButtons.l2,
+                                                output.analogButtons.r2,
+                                                output.leftStick.x,
+                                                output.leftStick.y,
+                                                output.rightStick.x,
+                                                output.rightStick.y,
+                                                static_cast<s64>(output.timestamp),
+                                                output.connectedCount});
+    }
+    Input::PadTrace::Record(
+        "READ_END", {static_cast<s64>(request), handle, num, result, static_cast<s64>(now)});
+    return result;
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
@@ -466,6 +508,9 @@ int PS4_SYSV_ABI scePadReadHistory() {
 
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
+    Input::PadTrace::EventScope trace_scope;
+    Input::PadTrace::Record("READ_STATE",
+                            {static_cast<s64>(Input::PadTrace::CurrentEvent()), handle});
     const int result = scePadRead(handle, pData, 1);
     return result < 0 ? result : ORBIS_OK;
 }
@@ -744,6 +789,7 @@ int PS4_SYSV_ABI Func_EF103E845B6F0420() {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+    Input::PadTrace::Initialize();
     Common::Singleton<GameControllers>::Instance()->TryOpenSDLControllers();
 
     LIB_FUNCTION("6ncge5+l5Qs", "libScePad", 1, "libScePad", scePadClose);

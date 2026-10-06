@@ -45,6 +45,7 @@
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
+#include "input/pad_trace.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
@@ -90,6 +91,7 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    Input::PadTrace::Shutdown();
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();

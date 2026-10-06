@@ -1240,6 +1240,8 @@ set(INPUT src/input/controller.cpp
           src/input/input_handler.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
+          src/input/pad_trace.cpp
+          src/input/pad_trace.h
 )
 
 set(EMULATOR src/emulator.cpp
@@ -1314,6 +1316,10 @@ else()
 endif()
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
+option(ENABLE_PADTRACE "Build asynchronous input diagnostics" OFF)
+if(ENABLE_PADTRACE)
+    target_compile_definitions(shadps4 PRIVATE ENABLE_PADTRACE)
+endif()
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 
 if (ENABLE_DISCORD_RPC)

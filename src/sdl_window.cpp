@@ -27,6 +27,7 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
+#include "input/pad_trace.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 
@@ -380,12 +381,21 @@ Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
 
 void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
     using Libraries::Pad::OrbisPadButtonDataOffset;
+    Input::PadTrace::EventScope trace_scope;
+    if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat && event->key.key == SDLK_F9) {
+        Input::PadTrace::Record("MARKER", {static_cast<s64>(Input::PadTrace::CurrentEvent())});
+    }
 
     // get the event's id, if it's keyup or keydown
     const bool input_down = event->type == SDL_EVENT_KEY_DOWN ||
                             event->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
                             event->type == SDL_EVENT_MOUSE_WHEEL;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);
+    Input::PadTrace::Record(
+        "RAW", {static_cast<s64>(Input::PadTrace::CurrentEvent()), event->type,
+                static_cast<s64>(event->common.timestamp), static_cast<s64>(input_event.input.type),
+                input_event.input.sdl_id, input_event.input.gamepad_id, input_event.active,
+                input_event.axis_value, event->type == SDL_EVENT_KEY_DOWN && event->key.repeat});
 
     // if it's a wheel event, make a timer that turns it off after a set time
     if (event->type == SDL_EVENT_MOUSE_WHEEL) {
@@ -395,6 +405,8 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 
     // add/remove it from the list
     bool inputs_changed = Input::UpdatePressedKeys(input_event);
+    Input::PadTrace::Record("INPUT_ACCEPT",
+                            {static_cast<s64>(Input::PadTrace::CurrentEvent()), inputs_changed});
 
     // update bindings
     if (inputs_changed) {
@@ -403,9 +415,20 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 }
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
+    Input::PadTrace::EventScope trace_scope;
     bool input_down = event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ||
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);
+    if (event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+        event->type == SDL_EVENT_GAMEPAD_BUTTON_UP ||
+        event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+        Input::PadTrace::Record(
+            "RAW", {static_cast<s64>(Input::PadTrace::CurrentEvent()), event->type,
+                    static_cast<s64>(event->common.timestamp),
+                    static_cast<s64>(input_event.input.type), input_event.input.sdl_id,
+                    input_event.input.gamepad_id, input_event.active, input_event.axis_value, 0,
+                    event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ? event->gaxis.value : 0});
+    }
 
     // the touchpad button shouldn't be rebound to anything else,
     // as it would break the entire touchpad handling
@@ -451,6 +474,8 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
 
     // add/remove it from the list
     bool inputs_changed = Input::UpdatePressedKeys(input_event);
+    Input::PadTrace::Record("INPUT_ACCEPT",
+                            {static_cast<s64>(Input::PadTrace::CurrentEvent()), inputs_changed});
 
     if (inputs_changed) {
         // update bindings

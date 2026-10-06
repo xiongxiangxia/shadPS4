@@ -16,6 +16,7 @@
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
 #include "input/controller.h"
+#include "input/pad_trace.h"
 
 namespace Input {
 
@@ -73,6 +74,8 @@ int GameController::ReadStates(State* states, int states_num) {
 
     if (!m_state.connected) {
         states[0] = m_state;
+        PadTrace::Record("QUEUE_READ", {static_cast<s64>(PadTrace::CurrentEvent()), user_id,
+                                        states_num, 1, m_trace_queue_size, m_trace_queue_size, 0});
         return 1;
     }
 
@@ -80,6 +83,8 @@ int GameController::ReadStates(State* states, int states_num) {
         // Retained history can make a later multi-sample read return up to 64 stale reports, so
         // mixed single- and multi-sample reads require dedicated tests.
         states[0] = m_state;
+        PadTrace::Record("QUEUE_READ", {static_cast<s64>(PadTrace::CurrentEvent()), user_id,
+                                        states_num, 1, m_trace_queue_size, m_trace_queue_size, 1});
         return 1;
     }
 
@@ -91,20 +96,34 @@ int GameController::ReadStates(State* states, int states_num) {
         }
         states[read_count++] = std::move(*state);
     }
+    const u32 previous_size = m_trace_queue_size;
+    m_trace_queue_size -= read_count;
+    PadTrace::Record("QUEUE_READ", {static_cast<s64>(PadTrace::CurrentEvent()), user_id, states_num,
+                                    read_count, previous_size, m_trace_queue_size, 2});
     return read_count;
 }
 
 void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {
     std::lock_guard lock{m_state_mutex};
+    const auto before = static_cast<u32>(m_state.buttonsState);
     m_state.OnButton(button, is_pressed);
     PushStateLocked();
+    PadTrace::Record("BUTTON", {static_cast<s64>(PadTrace::CurrentEvent()), user_id,
+                                static_cast<s64>(m_state.trace_id), static_cast<u32>(button),
+                                is_pressed, before, static_cast<u32>(m_state.buttonsState),
+                                static_cast<s64>(m_state.time)});
 }
 
 void GameController::Axis(Input::Axis axis, int value, bool smooth) {
     std::lock_guard lock{m_state_mutex};
     const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    const auto before = static_cast<u32>(m_state.buttonsState);
     m_state.OnAxis(axis, value, timestamp, smooth);
     PushStateLocked(timestamp);
+    PadTrace::Record("AXIS", {static_cast<s64>(PadTrace::CurrentEvent()), user_id,
+                              static_cast<s64>(m_state.trace_id), std::to_underlying(axis), value,
+                              smooth, before, static_cast<u32>(m_state.buttonsState),
+                              m_state.axes[std::to_underlying(axis)], static_cast<s64>(timestamp)});
 }
 
 void GameController::UpdateGyro(const float gyro[3]) {
@@ -159,6 +178,7 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
         SetLightBarRGB({});
     }
     m_states_queue.Clear();
+    m_trace_queue_size = 0;
     if (!m_state.connected) {
         ++m_state.connected_count;
         if (m_state.connected_count == 0) {
@@ -173,6 +193,7 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
 void GameController::DisconnectController() {
     std::lock_guard lock{m_state_mutex};
     m_states_queue.Clear();
+    m_trace_queue_size = 0;
     m_sdl_gamepad = nullptr;
 
     const u8 connected_count = m_state.connected_count;
@@ -210,9 +231,19 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.OnAccel(accel_buf);
     UpdateOrientationLocked(timestamp);
     m_state.time = timestamp;
+    m_state.trace_id = PadTrace::NextId();
+    m_state.trace_event = PadTrace::CurrentEvent();
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
     m_states_queue.Push(m_state);
+    const bool overwritten = m_trace_queue_size == 64;
+    m_trace_queue_size = std::min(m_trace_queue_size + 1, 64u);
+    PadTrace::Record("PUSH", {static_cast<s64>(m_state.trace_event), user_id,
+                              static_cast<s64>(m_state.trace_id), static_cast<s64>(timestamp),
+                              static_cast<u32>(m_state.buttonsState), m_state.connected,
+                              m_state.connected_count, m_trace_queue_size, overwritten,
+                              m_state.axes[0], m_state.axes[1], m_state.axes[2], m_state.axes[3],
+                              m_state.axes[4], m_state.axes[5]});
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {

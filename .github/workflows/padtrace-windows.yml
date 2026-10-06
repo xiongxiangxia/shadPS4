@@ -1,0 +1,49 @@
+name: PADTRACE Windows diagnostics
+
+on:
+  push:
+    branches: [padtrace-v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: padtrace-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Initialize MSVC environment
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: x64
+      - name: Configure diagnostic and baseline builds
+        run: |
+          cmake -G Ninja -B build-trace -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_PADTRACE=ON
+          cmake -G Ninja -B build-baseline -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_PADTRACE=OFF
+      - name: Build diagnostic executable
+        run: cmake --build build-trace --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Package diagnostic executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package\diagnostic -Force
+          Copy-Item build-trace\shadPS4.exe package\diagnostic\shadPS4.exe
+          Copy-Item documents\PADTRACE-v2.md package\diagnostic\PADTRACE-v2.md
+          Copy-Item tools\padtrace_summary.py package\diagnostic\padtrace_summary.py
+          Get-FileHash package\diagnostic\shadPS4.exe -Algorithm SHA256 | Format-List | Out-File package\diagnostic\SHA256.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shadPS4-PADTRACE-v2-windows-${{ github.sha }}
+          path: package/diagnostic/
+      - name: Build baseline executable
+        run: cmake --build build-baseline --parallel $env:NUMBER_OF_PROCESSORS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shadPS4-PADTRACE-v2-baseline-windows-${{ github.sha }}
+          path: build-baseline/shadPS4.exe
