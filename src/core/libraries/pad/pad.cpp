@@ -439,7 +439,8 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     Input::PadTrace::Record("READ_BEGIN",
                             {static_cast<s64>(request), handle, num, pData != nullptr,
                              static_cast<s64>(Libraries::Kernel::sceKernelGetProcessTime()),
-                             static_cast<s64>(caller)});
+                             static_cast<s64>(caller),
+                             reinterpret_cast<s64>(__builtin_return_address(0))});
     if (pData == nullptr || num < 1 || num > ORBIS_PAD_MAX_DATA_NUM) {
         Input::PadTrace::Record(
             "READ_END", {static_cast<s64>(request), handle, num, ORBIS_PAD_ERROR_INVALID_ARG});
@@ -510,7 +511,8 @@ int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
     Input::PadTrace::EventScope trace_scope;
     Input::PadTrace::Record("READ_STATE",
-                            {static_cast<s64>(Input::PadTrace::CurrentEvent()), handle});
+                            {static_cast<s64>(Input::PadTrace::CurrentEvent()), handle,
+                             reinterpret_cast<s64>(__builtin_return_address(0))});
     const int result = scePadRead(handle, pData, 1);
     return result < 0 ? result : ORBIS_OK;
 }

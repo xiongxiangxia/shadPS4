@@ -15,6 +15,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "input/pad_trace.h"
 
 namespace Libraries::Kernel {
 
@@ -480,7 +481,19 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
+    const u64 trace_request = Input::PadTrace::NextId();
+    Input::PadTrace::Record("EQUEUE_WAIT", {static_cast<s64>(trace_request), eq, num,
+                                            timo ? static_cast<s64>(*timo) : -1,
+                                            reinterpret_cast<s64>(__builtin_return_address(0))});
     *out = equeue->WaitForEvents(ev, num, timo);
+    Input::PadTrace::Record("EQUEUE_RETURN", {static_cast<s64>(trace_request), eq, *out,
+                                              *out == 0 ? ORBIS_KERNEL_ERROR_ETIMEDOUT : ORBIS_OK});
+    for (int i = 0; i < *out; ++i) {
+        Input::PadTrace::Record("EQUEUE_EVENT",
+                                {static_cast<s64>(trace_request), eq, i,
+                                 static_cast<s64>(ev[i].ident), ev[i].filter, ev[i].flags,
+                                 ev[i].fflags, static_cast<s64>(ev[i].data)});
+    }
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;

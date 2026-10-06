@@ -260,6 +260,13 @@ s32 PS4_SYSV_ABI sceVideoOutGetFlipStatus(s32 handle, FlipStatus* status) {
         *status = port->flip_status;
     }
 
+    Input::PadTrace::Record("FLIP_STATUS",
+                            {handle, static_cast<s64>(status->count),
+                             static_cast<s64>(status->process_time), static_cast<s64>(status->tsc),
+                             static_cast<s64>(status->submit_tsc), status->flip_arg,
+                             status->gc_queue_num, status->flip_pending_num, status->current_buffer,
+                             reinterpret_cast<s64>(__builtin_return_address(0))});
+
     LOG_TRACE(Lib_VideoOut,
               "count = {}, processTime = {}, tsc = {}, submitTsc = {}, flipArg = {}, gcQueueNum = "
               "{}, flipPendingNum = {}, currentBuffer = {}",
@@ -283,6 +290,10 @@ s32 PS4_SYSV_ABI sceVideoOutGetVblankStatus(int handle, SceVideoOutVblankStatus*
 
     std::unique_lock lock{port->vo_mutex};
     *status = port->vblank_status;
+    Input::PadTrace::Record("VBLANK_STATUS",
+                            {handle, static_cast<s64>(status->count),
+                             static_cast<s64>(status->process_time), static_cast<s64>(status->tsc),
+                             reinterpret_cast<s64>(__builtin_return_address(0))});
     return ORBIS_OK;
 }
 

@@ -41,13 +41,15 @@ u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
     // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
     const u64 value = clock->GetTimeUS(initial_ptc);
-    Input::PadTrace::ClockSample(0, value, 1000000);
+    Input::PadTrace::ClockSample(0, value, 1000000,
+                                 reinterpret_cast<u64>(__builtin_return_address(0)));
     return value;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
     const u64 value = clock->GetUptime() - initial_ptc;
-    Input::PadTrace::ClockSample(1, value, clock->GetTscFrequency());
+    Input::PadTrace::ClockSample(1, value, clock->GetTscFrequency(),
+                                 reinterpret_cast<u64>(__builtin_return_address(0)));
     return value;
 }
 
@@ -57,7 +59,8 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
     const u64 value = clock->GetUptime();
-    Input::PadTrace::ClockSample(2, value, clock->GetTscFrequency());
+    Input::PadTrace::ClockSample(2, value, clock->GetTscFrequency(),
+                                 reinterpret_cast<u64>(__builtin_return_address(0)));
     return value;
 }
 
@@ -124,7 +127,7 @@ s32 PS4_SYSV_ABI sceKernelSleep(u32 seconds) {
     return sceKernelUsleep(seconds * 1'000'000);
 }
 
-s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
+static s32 PosixClockGettimeImpl(u32 clock_id, OrbisKernelTimespec* ts) {
     if (ts == nullptr) {
         SetPosixErrno(EFAULT);
         return -1;
@@ -301,10 +304,23 @@ s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
 #endif
 }
 
+s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
+    const s32 result = PosixClockGettimeImpl(clock_id, ts);
+    if (result == 0) {
+        Input::PadTrace::ClockSample(3, static_cast<u64>(ts->tv_sec) * 1000000000 + ts->tv_nsec,
+                                     1000000000, reinterpret_cast<u64>(__builtin_return_address(0)),
+                                     clock_id);
+    }
+    return result;
+}
+
 s32 PS4_SYSV_ABI sceKernelClockGettime(const u32 clock_id, OrbisKernelTimespec* ts) {
     if (const auto ret = posix_clock_gettime(clock_id, ts); ret < 0) {
         return ErrnoToSceKernelError(*__Error());
     }
+    Input::PadTrace::ClockSample(5, static_cast<u64>(ts->tv_sec) * 1000000000 + ts->tv_nsec,
+                                 1000000000, reinterpret_cast<u64>(__builtin_return_address(0)),
+                                 clock_id);
     return ORBIS_OK;
 }
 
@@ -409,7 +425,7 @@ s32 PS4_SYSV_ABI sceKernelClockGetres(const u32 clock_id, OrbisKernelTimespec* r
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
+static s32 PosixGettimeofdayImpl(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
 #ifdef _WIN64
     if (tp) {
         FILETIME filetime;
@@ -457,9 +473,22 @@ s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone*
 #endif
 }
 
+s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone* tz) {
+    const s32 result = PosixGettimeofdayImpl(tp, tz);
+    if (result == 0 && tp) {
+        Input::PadTrace::ClockSample(4, static_cast<u64>(tp->tv_sec) * 1000000 + tp->tv_usec,
+                                     1000000, reinterpret_cast<u64>(__builtin_return_address(0)));
+    }
+    return result;
+}
+
 s32 PS4_SYSV_ABI sceKernelGettimeofday(OrbisKernelTimeval* tp) {
     if (const auto ret = posix_gettimeofday(tp, nullptr); ret < 0) {
         return ErrnoToSceKernelError(*__Error());
+    }
+    if (tp) {
+        Input::PadTrace::ClockSample(6, static_cast<u64>(tp->tv_sec) * 1000000 + tp->tv_usec,
+                                     1000000, reinterpret_cast<u64>(__builtin_return_address(0)));
     }
     return ORBIS_OK;
 }

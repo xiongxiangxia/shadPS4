@@ -8,13 +8,28 @@ process microseconds, TSC), `VBLANK` (count, process microseconds, TSC),
 `FLIP_SUBMIT` (handle, buffer index, mode, argument), and `VBLANK_WAIT`/`VBLANK_WAKE`
 (handle, vblank count). Presentation is not a measurement of guest animation progress.
 
-`CLOCK` fields are API (0 process microseconds, 1 process counter, 2 raw TSC), value,
-frequency, cumulative per-thread/API call count, backwards flag, previous call value,
-and current trace event ID. Each thread/API is sampled at most once per 10 ms except
-backwards values, which are always recorded. Emulator internal calls are included;
-event IDs associate scoped input/read calls, not guest code addresses. Other clock
-APIs and direct guest CPU timestamp instructions are not captured by these hooks.
+`CLOCK` fields are API (0 process microseconds, 1 process counter, 2 raw TSC,
+3 POSIX clock_gettime, 4 POSIX gettimeofday, 5 sceKernelClockGettime, 6 sceKernelGettimeofday),
+value, frequency, cumulative call count for that slot, backwards flag, previous call value,
+current trace event ID, return address, clock ID, and last recorded value.
+Each thread/API/caller/clock ID is sampled at most once per 10 ms except backwards values,
+which are always recorded. There are 128 slots per thread; `CLOCK_SLOTS_FULL` reports
+when additional call sites cannot be tracked. Emulator internal calls and wrapper calls
+are included; use module address ranges in shad_log.txt to identify guest callers.
+Direct guest CPU timestamp instructions are not captured by these hooks.
 Additional timing probes add overhead and do not expose the game's internal charge state.
+
+`READ_STATE` adds the return address in p2 and `READ_BEGIN` adds it in p6.
+`EQUEUE_WAIT` fields: request ID, queue, requested event count, timeout microseconds
+(-1 infinite), return address. `EQUEUE_RETURN`: request ID, queue, returned count,
+result. `EQUEUE_EVENT`: request ID, queue, sample index, ident, filter, flags, fflags,
+data. These expose delivered frame/GPU/timer events and wait durations, including timeouts.
+`FLIP_STATUS`: handle, count, process microseconds, TSC, submit TSC, flip argument,
+GPU queue count, pending count, current buffer, return address.
+`VBLANK_STATUS`: handle, count, process microseconds, TSC, return address.
+Return addresses can identify guest call sites, but are not charge variable addresses.
+Clock rates in the analyzer compare returned clock progress to host steady time;
+sampling overhead, preemption, and CPU-time clock IDs can legitimately produce rates other than 1.
 
 This build records input delivery, not DmC internal charge or animation state. It does not change
 button mappings, queue consumption, sampling, or emulated pad return values. The baseline uses the

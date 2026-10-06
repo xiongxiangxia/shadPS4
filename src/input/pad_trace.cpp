@@ -240,17 +240,44 @@ void Configuration(std::string_view text) {
     }
 }
 
-void ClockSample(u32 api, u64 value, u64 frequency) {
-    if (!Enabled() || api >= 3) {
+void ClockSample(u32 api, u64 value, u64 frequency, u64 caller, u32 clock_id) {
+    if (!Enabled()) {
         return;
     }
     struct Sample {
+        u32 api = 0;
+        u32 clock_id = 0;
+        u64 caller = 0;
         u64 value = 0;
+        u64 recorded_value = 0;
         u64 calls = 0;
         std::chrono::steady_clock::time_point recorded{};
     };
-    static thread_local std::array<Sample, 3> samples;
-    auto& sample = samples[api];
+    static thread_local std::array<Sample, 128> samples;
+    Sample* slot = nullptr;
+    const auto start = ((caller >> 4) ^ api ^ (clock_id << 3)) % samples.size();
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        auto& candidate = samples[(start + i) % samples.size()];
+        if (candidate.calls == 0 || (candidate.api == api && candidate.caller == caller &&
+                                     candidate.clock_id == clock_id)) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        static thread_local bool reported = false;
+        if (!reported) {
+            Record("CLOCK_SLOTS_FULL", {api, static_cast<s64>(caller), clock_id});
+            reported = true;
+        }
+        return;
+    }
+    auto& sample = *slot;
+    if (sample.calls == 0) {
+        sample.api = api;
+        sample.caller = caller;
+        sample.clock_id = clock_id;
+    }
     const auto now = std::chrono::steady_clock::now();
     const bool backwards = sample.calls != 0 && value < sample.value;
     const u64 previous = sample.value;
@@ -259,7 +286,9 @@ void ClockSample(u32 api, u64 value, u64 frequency) {
     if (backwards || now - sample.recorded >= std::chrono::milliseconds{10}) {
         Record("CLOCK", {api, static_cast<s64>(value), static_cast<s64>(frequency),
                          static_cast<s64>(sample.calls), backwards, static_cast<s64>(previous),
-                         static_cast<s64>(CurrentEvent())});
+                         static_cast<s64>(CurrentEvent()), static_cast<s64>(caller), clock_id,
+                         static_cast<s64>(sample.recorded_value)});
+        sample.recorded_value = value;
         sample.recorded = now;
     }
 }
@@ -291,7 +320,7 @@ u64 CurrentEvent() {
 }
 void Record(const char*, std::initializer_list<s64>) {}
 void Configuration(std::string_view) {}
-void ClockSample(u32, u64, u64) {}
+void ClockSample(u32, u64, u64, u64, u32) {}
 EventScope::EventScope() : previous{0} {}
 EventScope::~EventScope() {}
 } // namespace Input::PadTrace

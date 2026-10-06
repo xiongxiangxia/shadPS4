@@ -39,6 +39,14 @@ def summarize(path):
     dropped = 0
     limit_reached = False
     revision = None
+    clocks = {}
+    clock_previous = {}
+    frame_previous = {}
+    frame_max_gap = {}
+    waits = {}
+    wait_max_ms = 0
+    wait_timeouts = 0
+    read_callers = collections.Counter()
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -69,7 +77,37 @@ def summarize(path):
                 states.clear()
                 previous_read.clear()
                 raw_times.clear()
+                clock_previous.clear()
+                frame_previous.clear()
+                waits.clear()
                 markers.append({"recording": bool(p[0]), "monotonic_us": timestamp})
+            elif kind == "CLOCK":
+                key = (row["thread"], p[0], p[7], p[8])
+                stat = clocks.setdefault(key, {"samples": 0, "backwards": 0,
+                                               "frequency": p[2], "min_rate": None,
+                                               "max_rate": None})
+                stat["samples"] += 1
+                stat["backwards"] += bool(p[4])
+                previous = clock_previous.get(key)
+                if previous and timestamp > previous[0] and p[2] > 0:
+                    rate = (p[1] - previous[1]) * 1000000 / (p[2] * (timestamp - previous[0]))
+                    stat["min_rate"] = rate if stat["min_rate"] is None else min(stat["min_rate"], rate)
+                    stat["max_rate"] = rate if stat["max_rate"] is None else max(stat["max_rate"], rate)
+                clock_previous[key] = (timestamp, p[1])
+            elif kind in ("FRAME_PRESENT", "VBLANK"):
+                key = (row["thread"], kind)
+                if key in frame_previous:
+                    frame_max_gap[key] = max(frame_max_gap.get(key, 0), timestamp - frame_previous[key])
+                frame_previous[key] = timestamp
+            elif kind == "EQUEUE_WAIT":
+                waits[p[0]] = timestamp
+            elif kind == "EQUEUE_RETURN":
+                began = waits.pop(p[0], None)
+                if began is not None:
+                    wait_max_ms = max(wait_max_ms, (timestamp - began) / 1000)
+                wait_timeouts += p[2] == 0
+            elif kind == "READ_STATE":
+                read_callers[hex(p[2])] += 1
             elif kind == "RAW":
                 raw_times[p[0]] = timestamp
             elif kind == "FILTER":
@@ -130,6 +168,12 @@ def summarize(path):
         "duration_seconds": (end - start) / 1000000 if start is not None else 0,
         "events": dict(counts), "dropped_records": dropped, "limit_reached": limit_reached,
         "routing_filters": dict(filters),
+        "read_state_callers": dict(read_callers),
+        "clocks": [{"thread": key[0], "api": key[1], "caller": hex(key[2]),
+                    "clock_id": key[3], **value} for key, value in clocks.items()],
+        "max_frame_gap_ms": {f"{key[0]}:{key[1]}": value / 1000
+                             for key, value in frame_max_gap.items()},
+        "max_equeue_wait_ms": wait_max_ms, "equeue_timeouts": wait_timeouts,
         "markers": markers, "max_sample_age_ms": max_age / 1000,
         "max_raw_to_push_ms": max_raw_to_push / 1000,
         "max_read_gap_ms_by_thread_handle": {
