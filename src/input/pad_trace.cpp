@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "input/dmc_charge_trace.h"
 #include "input/pad_trace.h"
 
 #ifdef ENABLE_PADTRACE
@@ -185,6 +186,7 @@ bool Toggle() {
     }
     if (!was_enabled) {
         Record("CAPTURE", {1});
+        DmcChargeTrace::Install();
     }
     recorder.wake.notify_one();
     LOG_INFO(Input, "[PADTRACE] Recording {}", was_enabled ? "OFF" : "ON");

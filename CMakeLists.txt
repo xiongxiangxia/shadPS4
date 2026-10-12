@@ -1242,6 +1242,8 @@ set(INPUT src/input/controller.cpp
           src/input/input_mouse.h
           src/input/pad_trace.cpp
           src/input/pad_trace.h
+          src/input/dmc_charge_trace.cpp
+          src/input/dmc_charge_trace.h
 )
 
 set(EMULATOR src/emulator.cpp

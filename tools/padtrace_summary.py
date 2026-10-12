@@ -47,6 +47,9 @@ def summarize(path):
     wait_max_ms = 0
     wait_timeouts = 0
     read_callers = collections.Counter()
+    dmc_pending = {}
+    dmc_assignments = []
+    dmc_total = 0
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -80,6 +83,7 @@ def summarize(path):
                 clock_previous.clear()
                 frame_previous.clear()
                 waits.clear()
+                dmc_pending.clear()
                 markers.append({"recording": bool(p[0]), "monotonic_us": timestamp})
             elif kind == "CLOCK":
                 key = (row["thread"], p[0], p[7], p[8])
@@ -108,6 +112,23 @@ def summarize(path):
                 wait_timeouts += p[2] == 0
             elif kind == "READ_STATE":
                 read_callers[hex(p[2])] += 1
+            elif kind == "DMC_LET_BEGIN":
+                dmc_pending[p[0]] = (timestamp, p)
+            elif kind == "DMC_LET_END":
+                began = dmc_pending.pop(p[0], None)
+                if began:
+                    dmc_total += 1
+                    if len(dmc_assignments) < 100:
+                        before, source = began
+                        dmc_assignments.append({
+                            "monotonic_us": before, "property": hex(source[4]),
+                            "owner_property": hex(source[5]), "destination": hex(p[1]),
+                            "literal_bits": hex(source[6]), "readback_bits": hex(p[3]),
+                            "readable": bool(p[4]), "property_matches": bool(p[5]),
+                            "cleanup_candidate": bool(source[7]),
+                            "tracked_candidate": bool(source[8]),
+                            "handler_duration_us": timestamp - before,
+                        })
             elif kind == "RAW":
                 raw_times[p[0]] = timestamp
             elif kind == "FILTER":
@@ -169,6 +190,8 @@ def summarize(path):
         "events": dict(counts), "dropped_records": dropped, "limit_reached": limit_reached,
         "routing_filters": dict(filters),
         "read_state_callers": dict(read_callers),
+        "dmc_assignment_count": dmc_total,
+        "dmc_assignments_first_100": dmc_assignments,
         "clocks": [{"thread": key[0], "api": key[1], "caller": hex(key[2]),
                     "clock_id": key[3], **value} for key, value in clocks.items()],
         "max_frame_gap_ms": {f"{key[0]}:{key[1]}": value / 1000

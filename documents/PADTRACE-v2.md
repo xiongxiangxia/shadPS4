@@ -1,5 +1,42 @@
 # PADTRACE v2 input diagnostic build
 
+## DmC script assignment observer (experimental, Windows only)
+
+This extension replaces selected interpreter dispatch pointers in process memory, leaving
+the original game files intact. It delegates to the original interpreter handlers and does
+not change field values or action decisions. It is installed when F9 starts recording, only
+for CUSA01022 01.03 with matching interpreter bytes, global-reference bytes, and assignment
+dispatch pointer. A validation failure leaves the hook uninstalled and emits `DMC_HOOK` with 0.
+The build has not been validated in a running game by its author. Hooks and probes add timing
+overhead; compare with the baseline if the reproduction changes.
+
+`DMC_LET_BEGIN`: request, object, FFrame, operand code pointer, property metadata pointer,
+owner-property metadata pointer, literal float bits, cleanup-pattern candidate flag,
+previously identified candidate-property flag. Only contextual float constants 0/1 are captured.
+`DMC_LET_END`: request, interpreter destination address, interpreter property pointer,
+read-back float bits, readable flag, property-match flag, final operand pointer.
+Read-back is evidence only when the readable/property-match flags are both 1. Earlier writes
+can be associated retroactively using the property metadata address from a cleanup candidate.
+
+`DMC_FRAME`: request, depth, frame address, node, object, code, previous-frame candidate,
+node-name bits, outer-name bits. The FFrame/UObject offsets other than the confirmed operand
+pointer are provisional. These are raw diagnostic snapshots, not resolved function names or
+proof of a fully validated stack. Traversal is bounded to eight frames and readable regions.
+
+The cleanup-pattern candidate matches a superclass call followed by three contextual 0.0
+assignments to distinct properties of the same owner, as found in RangedCharge.CommonCleanup.
+It is not a unique function fingerprint; other functions may match. Names and identity must
+be confirmed from runtime data before treating the first property as m_fcpGunCharge.
+
+`DMC_CALL_BEGIN`: request, virtual-name flag, target function pointer or FName bits, object,
+frame, code. `DMC_CALL_END`: request, virtual-name flag, target. The observer learns up to 64
+candidate nodes from cleanup/related assignments, so initial entries before discovery may be
+absent. These events describe script calls, not authoritative start/interrupt/exit reasons.
+`DMC_HOOK_CALL`: token (0x1b virtual, 0x1c final), installed flag, original handler.
+Failure to install a call hook leaves assignment observation available. Native calls and
+other execution paths may bypass these call tokens; absence of an event does not prove
+absence of an action. No gameplay repair is included.
+
 ## Frame and clock extension
 
 The extended build also records `FRAME_QUEUE` (buffer index, flip argument, EOP flag,
