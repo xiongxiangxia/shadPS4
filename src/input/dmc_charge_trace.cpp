@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <windows.h>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -20,15 +19,8 @@ namespace Input::DmcChargeTrace {
 namespace {
 using Native = void(PS4_SYSV_ABI*)(void*, void*, void*);
 std::atomic<Native> original;
-std::atomic<Native> original_final;
-std::atomic<Native> original_virtual;
 std::atomic<u64> charge_property{0};
-std::mutex nodes_mutex;
-struct NodeEntry {
-    u64 address = 0;
-    u64 name = 0;
-};
-std::array<NodeEntry, 64> nodes{};
+std::atomic<u64> capture_generation{0};
 u64 guest_base = 0;
 
 bool Read(u64 address, void* output, std::size_t size) {
@@ -93,40 +85,11 @@ bool IsCleanupCandidate(u64 code, const Assignment& first) {
            first.property != third.property && second.property != third.property;
 }
 
-void RememberNode(u64 node) {
-    if (node == 0) {
-        return;
-    }
-    std::lock_guard lock{nodes_mutex};
-    for (auto& entry : nodes) {
-        if (entry.address == node) {
-            return;
-        }
-        if (entry.address == 0) {
-            entry = {node, Word(node + 0x48)};
-            return;
-        }
-    }
-}
-
-bool Watched(u64 value, bool name) {
-    std::lock_guard lock{nodes_mutex};
-    for (const auto& node : nodes) {
-        if (node.address != 0 && (name ? node.name == value : node.address == value)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void Frames(u64 request, u64 frame, bool remember) {
-    for (int depth = 0; depth < 8 && frame != 0; ++depth) {
+void Frames(u64 request, u64 frame) {
+    for (int depth = 0; depth < 3 && frame != 0; ++depth) {
         std::array<u64, 9> words{};
         if (!Read(frame, words.data(), sizeof(words))) {
             break;
-        }
-        if (remember) {
-            RememberNode(words[3]);
         }
         PadTrace::Record("DMC_FRAME", {static_cast<s64>(request), depth, static_cast<s64>(frame),
                                        static_cast<s64>(words[3]), static_cast<s64>(words[4]),
@@ -140,59 +103,74 @@ void Frames(u64 request, u64 frame, bool remember) {
     }
 }
 
-void ObserveCall(Native handler, bool name, void* object, void* frame, void* result) {
-    const u64 code = PadTrace::Enabled() ? Word(reinterpret_cast<u64>(frame) + 0x28) : 0;
-    const u64 target = code != 0 ? Word(code) : 0;
-    const bool matched = code != 0 && Watched(target, name);
-    const u64 request = matched ? PadTrace::NextId() : 0;
-    if (matched) {
-        PadTrace::Record("DMC_CALL_BEGIN", {static_cast<s64>(request), name,
-                                            static_cast<s64>(target), reinterpret_cast<s64>(object),
-                                            reinterpret_cast<s64>(frame), static_cast<s64>(code)});
-        Frames(request, reinterpret_cast<u64>(frame), true);
-    }
-    handler(object, frame, result);
-    if (matched) {
-        PadTrace::Record("DMC_CALL_END",
-                         {static_cast<s64>(request), name, static_cast<s64>(target)});
-    }
-}
+struct CachedAssignment {
+    u64 code = 0;
+    Assignment assignment{};
+    bool matched = false;
+    bool cleanup = false;
+    bool reported = false;
+};
 
-void PS4_SYSV_ABI ObserveFinal(void* object, void* frame, void* result) {
-    const auto handler = original_final.load(std::memory_order_acquire);
-    if (!PadTrace::Enabled()) {
-        return handler(object, frame, result);
-    }
-    ObserveCall(handler, false, object, frame, result);
-}
+struct ProbeCache {
+    u64 generation = 0;
+    u32 discoveries = 0;
+    u32 records = 0;
+    std::array<CachedAssignment, 4096> sites{};
+};
 
-void PS4_SYSV_ABI ObserveVirtual(void* object, void* frame, void* result) {
-    const auto handler = original_virtual.load(std::memory_order_acquire);
-    if (!PadTrace::Enabled()) {
-        return handler(object, frame, result);
-    }
-    ObserveCall(handler, true, object, frame, result);
+thread_local ProbeCache probe_cache;
+
+u64 Operand(void* frame) {
+    u64 code = 0;
+    std::memcpy(&code, static_cast<const u8*>(frame) + 0x28, sizeof(code));
+    return code;
 }
 
 void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     const auto handler = original.load(std::memory_order_acquire);
-    Assignment assignment;
-    const u64 code = PadTrace::Enabled() ? Word(reinterpret_cast<u64>(frame) + 0x28) : 0;
-    const bool matched = code != 0 && Decode(code, assignment);
-    const bool cleanup = matched && IsCleanupCandidate(code, assignment);
-    const u64 request = matched ? PadTrace::NextId() : 0;
+    if (!PadTrace::Enabled()) {
+        return handler(object, frame, result);
+    }
+    const u64 generation = capture_generation.load(std::memory_order_relaxed);
+    if (probe_cache.generation != generation) {
+        probe_cache = {};
+        probe_cache.generation = generation;
+    }
+    if (probe_cache.records >= 4096) {
+        return handler(object, frame, result);
+    }
+    const u64 code = Operand(frame);
+    auto& site = probe_cache.sites[(code >> 2) % probe_cache.sites.size()];
+    if (site.code != code) {
+        site = {};
+        site.code = code;
+        site.matched = code != 0 && Decode(code, site.assignment);
+        site.cleanup = site.matched && IsCleanupCandidate(code, site.assignment);
+    }
+    const Assignment assignment = site.assignment;
+    const bool cleanup = site.cleanup;
     if (cleanup) {
         charge_property.store(assignment.property, std::memory_order_relaxed);
     }
+    const bool tracked =
+        site.matched && assignment.property == charge_property.load(std::memory_order_relaxed);
+    const bool discovery = site.matched && !site.reported && probe_cache.discoveries < 128;
+    const bool matched = (tracked || discovery) && probe_cache.records < 4096;
+    const u64 request = matched ? PadTrace::NextId() : 0;
     if (matched) {
-        PadTrace::Record("DMC_LET_BEGIN",
-                         {static_cast<s64>(request), reinterpret_cast<s64>(object),
-                          reinterpret_cast<s64>(frame), static_cast<s64>(code),
-                          static_cast<s64>(assignment.property),
-                          static_cast<s64>(assignment.owner_property), assignment.value, cleanup,
-                          assignment.property == charge_property.load()});
-        Frames(request, reinterpret_cast<u64>(frame),
-               cleanup || assignment.property == charge_property.load());
+        ++probe_cache.records;
+        site.reported = true;
+        if (discovery) {
+            ++probe_cache.discoveries;
+        }
+        PadTrace::Record("DMC_LET_BEGIN", {static_cast<s64>(request), reinterpret_cast<s64>(object),
+                                           reinterpret_cast<s64>(frame), static_cast<s64>(code),
+                                           static_cast<s64>(assignment.property),
+                                           static_cast<s64>(assignment.owner_property),
+                                           assignment.value, cleanup, tracked});
+        if (cleanup || discovery) {
+            Frames(request, reinterpret_cast<u64>(frame));
+        }
     }
     handler(object, frame, result);
     if (matched) {
@@ -203,13 +181,16 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
         PadTrace::Record("DMC_LET_END",
                          {static_cast<s64>(request), static_cast<s64>(destination),
                           static_cast<s64>(property), actual, readable,
-                          property == assignment.property,
-                          static_cast<s64>(Word(reinterpret_cast<u64>(frame) + 0x28))});
+                          property == assignment.property, static_cast<s64>(Operand(frame))});
+        if (probe_cache.records == 4096) {
+            PadTrace::Record("DMC_PROBE_LIMIT", {4096});
+        }
     }
 }
 } // namespace
 
 void Install() {
+    capture_generation.fetch_add(1, std::memory_order_relaxed);
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;
@@ -247,23 +228,6 @@ void Install() {
         return;
     }
     PadTrace::Record("DMC_HOOK", {1, static_cast<s64>(base), static_cast<s64>(slot)});
-    const auto install_call = [base](u32 token, Native observer, std::atomic<Native>& saved) {
-        const u64 entry = base + 0x3960040 + token * 16;
-        const u64 target = Word(entry);
-        if (target < base || target >= base + 0x2f7b360 || (target & 1) != 0 ||
-            Word(entry + 8) != 0) {
-            PadTrace::Record("DMC_HOOK_CALL", {token, 0, static_cast<s64>(target)});
-            return;
-        }
-        saved.store(reinterpret_cast<Native>(target), std::memory_order_release);
-        const auto prior = InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(entry),
-                                                        reinterpret_cast<LONG64>(observer),
-                                                        static_cast<LONG64>(target));
-        PadTrace::Record("DMC_HOOK_CALL",
-                         {token, static_cast<u64>(prior) == target, static_cast<s64>(target)});
-    };
-    install_call(0x1c, &ObserveFinal, original_final);
-    install_call(0x1b, &ObserveVirtual, original_virtual);
     LOG_INFO(
         Input,
         "[DMC TRACE] Script assignment observer installed; cleanup identification is provisional");

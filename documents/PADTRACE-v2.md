@@ -21,21 +21,25 @@ can be associated retroactively using the property metadata address from a clean
 `DMC_FRAME`: request, depth, frame address, node, object, code, previous-frame candidate,
 node-name bits, outer-name bits. The FFrame/UObject offsets other than the confirmed operand
 pointer are provisional. These are raw diagnostic snapshots, not resolved function names or
-proof of a fully validated stack. Traversal is bounded to eight frames and readable regions.
+proof of a fully validated stack. Traversal is bounded to three frames and readable regions.
 
 The cleanup-pattern candidate matches a superclass call followed by three contextual 0.0
 assignments to distinct properties of the same owner, as found in RangedCharge.CommonCleanup.
 It is not a unique function fingerprint; other functions may match. Names and identity must
 be confirmed from runtime data before treating the first property as m_fcpGunCharge.
 
-`DMC_CALL_BEGIN`: request, virtual-name flag, target function pointer or FName bits, object,
-frame, code. `DMC_CALL_END`: request, virtual-name flag, target. The observer learns up to 64
-candidate nodes from cleanup/related assignments, so initial entries before discovery may be
-absent. These events describe script calls, not authoritative start/interrupt/exit reasons.
-`DMC_HOOK_CALL`: token (0x1b virtual, 0x1c final), installed flag, original handler.
-Failure to install a call hook leaves assignment observation available. Native calls and
-other execution paths may bypass these call tokens; absence of an event does not prove
-absence of an action. No gameplay repair is included.
+The low-overhead revision removes virtual/final call hooks. Assignment decoding, including
+negative results, is cached per thread and operand address, reset on each F9 capture start.
+This assumes script bytecode stays immutable during a capture. Only the first occurrence of
+up to 128 discovery assignments per thread is recorded; candidate-property writes continue,
+with a hard limit of 4096 assignment pairs per thread per capture. Unrelated repeated writes
+are omitted. Stack snapshots are limited to discovery and cleanup candidates. The live operand
+pointer uses the validated native handler's FFrame offset without per-call VirtualQuery.
+Checked memory reads remain for cold decoding and recorded snapshots/read-back.
+There are no DMC_CALL_BEGIN/END or DMC_HOOK_CALL events in this revision. Consequently these
+logs cannot independently identify every action entry, interruption, or caller. Candidate
+identity remains provisional, and missing events do not prove absence of an action or write.
+No gameplay repair is included.
 
 ## Frame and clock extension
 
