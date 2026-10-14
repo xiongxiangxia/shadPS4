@@ -50,6 +50,8 @@ def summarize(path):
     dmc_pending = {}
     dmc_assignments = []
     dmc_total = 0
+    dmc_branches = []
+    dmc_probe_limits = []
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -114,6 +116,16 @@ def summarize(path):
                 read_callers[hex(p[2])] += 1
             elif kind == "DMC_LET_BEGIN":
                 dmc_pending[p[0]] = (timestamp, p)
+            elif kind == "DMC_BRANCH":
+                if len(dmc_branches) < 100:
+                    dmc_branches.append({
+                        "monotonic_us": timestamp, "object": hex(p[1]), "node": hex(p[3]),
+                        "operand_before": hex(p[4]), "operand_after": hex(p[5]),
+                        "changed_outcome": bool(p[6]), "first_observation": bool(p[7]),
+                    })
+            elif kind in ("DMC_PROBE_LIMIT", "DMC_BRANCH_LIMIT"):
+                dmc_probe_limits.append({"monotonic_us": timestamp, "kind": kind,
+                                         "thread": row["thread"], "p0": p[0], "p1": p[1]})
             elif kind == "DMC_LET_END":
                 began = dmc_pending.pop(p[0], None)
                 if began:
@@ -191,6 +203,8 @@ def summarize(path):
         "routing_filters": dict(filters),
         "read_state_callers": dict(read_callers),
         "dmc_assignment_count": dmc_total,
+        "dmc_branches_first_100": dmc_branches,
+        "dmc_probe_limits": dmc_probe_limits,
         "dmc_assignments_first_100": dmc_assignments,
         "clocks": [{"thread": key[0], "api": key[1], "caller": hex(key[2]),
                     "clock_id": key[3], **value} for key, value in clocks.items()],

@@ -285,7 +285,7 @@ void ClockSample(u32 api, u64 value, u64 frequency, u64 caller, u32 clock_id) {
     const u64 previous = sample.value;
     sample.value = value;
     ++sample.calls;
-    if (backwards || now - sample.recorded >= std::chrono::milliseconds{10}) {
+    if (backwards || now - sample.recorded >= std::chrono::milliseconds{100}) {
         Record("CLOCK", {api, static_cast<s64>(value), static_cast<s64>(frequency),
                          static_cast<s64>(sample.calls), backwards, static_cast<s64>(previous),
                          static_cast<s64>(CurrentEvent()), static_cast<s64>(caller), clock_id,

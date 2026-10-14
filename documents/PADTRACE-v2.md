@@ -21,7 +21,8 @@ can be associated retroactively using the property metadata address from a clean
 `DMC_FRAME`: request, depth, frame address, node, object, code, previous-frame candidate,
 node-name bits, outer-name bits. The FFrame/UObject offsets other than the confirmed operand
 pointer are provisional. These are raw diagnostic snapshots, not resolved function names or
-proof of a fully validated stack. Traversal is bounded to three frames and readable regions.
+proof of a fully validated stack. Only the current frame is recorded at bounded discovery
+sites; previous-frame pointers are not traversed.
 
 The cleanup-pattern candidate matches a superclass call followed by three contextual 0.0
 assignments to distinct properties of the same owner, as found in RangedCharge.CommonCleanup.
@@ -30,16 +31,39 @@ be confirmed from runtime data before treating the first property as m_fcpGunCha
 
 The low-overhead revision removes virtual/final call hooks. Assignment decoding, including
 negative results, is cached per thread and operand address, reset on each F9 capture start.
-This assumes script bytecode stays immutable during a capture. Only the first occurrence of
-up to 128 discovery assignments per thread is recorded; candidate-property writes continue,
-with a hard limit of 4096 assignment pairs per thread per capture. Unrelated repeated writes
-are omitted. Stack snapshots are limited to discovery and cleanup candidates. The live operand
-pointer uses the validated native handler's FFrame offset without per-call VirtualQuery.
-Checked memory reads remain for cold decoding and recorded snapshots/read-back.
+This assumes script bytecode stays immutable during a capture. All matching contextual float
+0/1 assignments are recorded, including repeated writes, with a hard limit of 4096 assignment
+pairs per thread per capture (`DMC_PROBE_LIMIT`). Current-frame snapshots are limited to 128
+discovery sites. Operand/frame reads use live interpreter objects; read-back is directly copied
+only when the interpreter's destination is nonzero and property metadata matches. Cold decoding
+and provisional node metadata still use checked reads. These probes assume the native handler's
+live objects remain valid until it returns. They do not observe every possible field-write opcode.
 There are no DMC_CALL_BEGIN/END or DMC_HOOK_CALL events in this revision. Consequently these
 logs cannot independently identify every action entry, interruption, or caller. Candidate
 identity remains provisional, and missing events do not prove absence of an action or write.
 No gameplay repair is included.
+
+`DMC_HOOK_BRANCH`: installed flag, original JumpIfNot handler. This experimental probe handles
+token 0x07 only when its dispatch pointer is within the matching game's code image and its
+member-function adjustment is zero. It delegates to the original handler without changing its
+arguments or branch decisions. The initial contextual-condition prefix is read from live code.
+Per-thread decoding is capped at 1024 cache misses; branch events are capped at 512 per capture,
+with `DMC_BRANCH_LIMIT` emitted at either limit. The broad contextual-prefix filter is discovery,
+not a confirmed charge-condition filter. Native action-graph decisions can bypass this opcode.
+
+`DMC_BRANCH`: request, object, frame, node, operand before evaluation, operand after evaluation,
+changed-from-previous-outcome flag, first-observation flag, cache-miss count, event count.
+Only first observations and changed post-evaluation pointers are recorded. The pointer change
+is raw control-flow evidence, NOT an already decoded true/false condition or cancellation reason.
+Compare against the function's bytecode before interpreting its direction. Repeated identical
+outcomes and different objects at the same site may be omitted. For the first 64 recorded events,
+new sites include a current-frame snapshot and `DMC_BRANCH_CODE` (request, four raw u64 words
+starting at the pre-evaluation operand) to help associate the condition with static scripts.
+
+Recommended test order: one successful delayed-attack charge first, then an immediate-attack
+failure, then another success, without changing weapon or scene. Keep the capture short and
+report the outcome/order and any recording-induced stalls. Timing conclusions require smooth
+reproduction and must not treat hook-induced stalls as the original defect.
 
 ## Frame and clock extension
 
@@ -53,7 +77,7 @@ process microseconds, TSC), `VBLANK` (count, process microseconds, TSC),
 3 POSIX clock_gettime, 4 POSIX gettimeofday, 5 sceKernelClockGettime, 6 sceKernelGettimeofday),
 value, frequency, cumulative call count for that slot, backwards flag, previous call value,
 current trace event ID, return address, clock ID, and last recorded value.
-Each thread/API/caller/clock ID is sampled at most once per 10 ms except backwards values,
+Each thread/API/caller/clock ID is sampled at most once per 100 ms except backwards values,
 which are always recorded. There are 128 slots per thread; `CLOCK_SLOTS_FULL` reports
 when additional call sites cannot be tracked. Emulator internal calls and wrapper calls
 are included; use module address ranges in shad_log.txt to identify guest callers.

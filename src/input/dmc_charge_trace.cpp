@@ -19,6 +19,7 @@ namespace Input::DmcChargeTrace {
 namespace {
 using Native = void(PS4_SYSV_ABI*)(void*, void*, void*);
 std::atomic<Native> original;
+std::atomic<Native> original_jump;
 std::atomic<u64> charge_property{0};
 std::atomic<u64> capture_generation{0};
 u64 guest_base = 0;
@@ -85,22 +86,23 @@ bool IsCleanupCandidate(u64 code, const Assignment& first) {
            first.property != third.property && second.property != third.property;
 }
 
-void Frames(u64 request, u64 frame) {
-    for (int depth = 0; depth < 3 && frame != 0; ++depth) {
-        std::array<u64, 9> words{};
-        if (!Read(frame, words.data(), sizeof(words))) {
-            break;
-        }
-        PadTrace::Record("DMC_FRAME", {static_cast<s64>(request), depth, static_cast<s64>(frame),
-                                       static_cast<s64>(words[3]), static_cast<s64>(words[4]),
-                                       static_cast<s64>(words[5]), static_cast<s64>(words[7]),
-                                       static_cast<s64>(Word(words[3] + 0x48)),
-                                       static_cast<s64>(Word(Word(words[3] + 0x40) + 0x48))});
-        if (words[7] == frame) {
-            break;
-        }
-        frame = words[7];
-    }
+u64 LiveWord(u64 address) {
+    u64 value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return value;
+}
+
+void FrameSite(u64 request, void* frame) {
+    const u64 address = reinterpret_cast<u64>(frame);
+    const u64 node = LiveWord(address + 0x18);
+    const u64 outer = node != 0 ? Word(node + 0x40) : 0;
+    PadTrace::Record("DMC_FRAME",
+                     {static_cast<s64>(request), 0, static_cast<s64>(address),
+                      static_cast<s64>(node), static_cast<s64>(LiveWord(address + 0x20)),
+                      static_cast<s64>(LiveWord(address + 0x28)),
+                      static_cast<s64>(LiveWord(address + 0x38)),
+                      static_cast<s64>(node != 0 ? Word(node + 0x48) : 0),
+                      static_cast<s64>(outer != 0 ? Word(outer + 0x48) : 0)});
 }
 
 struct CachedAssignment {
@@ -144,7 +146,9 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     if (site.code != code) {
         site = {};
         site.code = code;
-        site.matched = code != 0 && Decode(code, site.assignment);
+        const auto* operand = reinterpret_cast<const u8*>(code);
+        site.matched =
+            code != 0 && operand[0] == 0x19 && operand[1] == 0x01 && Decode(code, site.assignment);
         site.cleanup = site.matched && IsCleanupCandidate(code, site.assignment);
     }
     const Assignment assignment = site.assignment;
@@ -155,7 +159,7 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     const bool tracked =
         site.matched && assignment.property == charge_property.load(std::memory_order_relaxed);
     const bool discovery = site.matched && !site.reported && probe_cache.discoveries < 128;
-    const bool matched = (tracked || discovery) && probe_cache.records < 4096;
+    const bool matched = site.matched && probe_cache.records < 4096;
     const u64 request = matched ? PadTrace::NextId() : 0;
     if (matched) {
         ++probe_cache.records;
@@ -168,22 +172,100 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
                                            static_cast<s64>(assignment.property),
                                            static_cast<s64>(assignment.owner_property),
                                            assignment.value, cleanup, tracked});
-        if (cleanup || discovery) {
-            Frames(request, reinterpret_cast<u64>(frame));
+        if (discovery) {
+            FrameSite(request, frame);
         }
     }
     handler(object, frame, result);
     if (matched) {
-        const u64 destination = Word(guest_base + 0x3940bc0);
-        const u64 property = Word(guest_base + 0x3940b90);
+        const u64 destination = LiveWord(guest_base + 0x3940bc0);
+        const u64 property = LiveWord(guest_base + 0x3940b90);
         u32 actual = 0;
-        const bool readable = Read(destination, &actual, sizeof(actual));
+        const bool readable = destination != 0 && property == assignment.property;
+        if (readable) {
+            std::memcpy(&actual, reinterpret_cast<const void*>(destination), sizeof(actual));
+        }
         PadTrace::Record("DMC_LET_END",
                          {static_cast<s64>(request), static_cast<s64>(destination),
                           static_cast<s64>(property), actual, readable,
                           property == assignment.property, static_cast<s64>(Operand(frame))});
         if (probe_cache.records == 4096) {
             PadTrace::Record("DMC_PROBE_LIMIT", {4096});
+        }
+    }
+}
+
+struct BranchSite {
+    u64 code = 0;
+    bool matched = false;
+    bool reported = false;
+    u64 next = 0;
+};
+
+struct BranchCache {
+    u64 generation = 0;
+    u32 probes = 0;
+    u32 records = 0;
+    std::array<BranchSite, 4096> sites{};
+};
+
+thread_local BranchCache branch_cache;
+
+void PS4_SYSV_ABI ObserveJump(void* object, void* frame, void* result) {
+    const auto handler = original_jump.load(std::memory_order_acquire);
+    if (!PadTrace::Enabled()) {
+        return handler(object, frame, result);
+    }
+    const u64 generation = capture_generation.load(std::memory_order_relaxed);
+    if (branch_cache.generation != generation) {
+        branch_cache = {};
+        branch_cache.generation = generation;
+    }
+    const u64 code = Operand(frame);
+    auto& site = branch_cache.sites[(code >> 2) % branch_cache.sites.size()];
+    if (site.code != code && branch_cache.probes < 1024) {
+        ++branch_cache.probes;
+        site = {};
+        site.code = code;
+        const auto* expression = reinterpret_cast<const u8*>(code + 2);
+        site.matched = code != 0 && expression[0] == 0x19 &&
+                       (expression[1] == 0x01 || (expression[1] == 0x19 && expression[2] == 0x01));
+        if (branch_cache.probes == 1024) {
+            PadTrace::Record("DMC_BRANCH_LIMIT", {branch_cache.probes, branch_cache.records});
+        }
+    }
+    const bool matched = site.code == code && site.matched && branch_cache.records < 512;
+    const u64 node = matched ? LiveWord(reinterpret_cast<u64>(frame) + 0x18) : 0;
+    handler(object, frame, result);
+    if (!matched) {
+        return;
+    }
+    const u64 next = Operand(frame);
+    if (site.code != code) {
+        return;
+    }
+    if (!site.reported || site.next != next) {
+        const bool first = !site.reported;
+        site.reported = true;
+        site.next = next;
+        ++branch_cache.records;
+        const u64 request = PadTrace::NextId();
+        PadTrace::Record("DMC_BRANCH", {static_cast<s64>(request), reinterpret_cast<s64>(object),
+                                        reinterpret_cast<s64>(frame), static_cast<s64>(node),
+                                        static_cast<s64>(code), static_cast<s64>(next), !first,
+                                        first, branch_cache.probes, branch_cache.records});
+        if (first && branch_cache.records <= 64) {
+            FrameSite(request, frame);
+            std::array<u64, 4> words{};
+            if (Read(code, words.data(), sizeof(words))) {
+                PadTrace::Record("DMC_BRANCH_CODE",
+                                 {static_cast<s64>(request), static_cast<s64>(words[0]),
+                                  static_cast<s64>(words[1]), static_cast<s64>(words[2]),
+                                  static_cast<s64>(words[3])});
+            }
+        }
+        if (branch_cache.records == 512) {
+            PadTrace::Record("DMC_BRANCH_LIMIT", {branch_cache.probes, branch_cache.records});
         }
     }
 }
@@ -228,6 +310,16 @@ void Install() {
         return;
     }
     PadTrace::Record("DMC_HOOK", {1, static_cast<s64>(base), static_cast<s64>(slot)});
+    const u64 jump_slot = base + 0x3960040 + 0x07 * 16;
+    const u64 jump_target = Word(jump_slot);
+    if (jump_target >= base && jump_target < base + 0x2f7b360 && Word(jump_slot + 8) == 0) {
+        original_jump.store(reinterpret_cast<Native>(jump_target), std::memory_order_release);
+        const auto prior = InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(jump_slot), reinterpret_cast<LONG64>(&ObserveJump),
+            static_cast<LONG64>(jump_target));
+        PadTrace::Record("DMC_HOOK_BRANCH",
+                         {static_cast<u64>(prior) == jump_target, static_cast<s64>(jump_target)});
+    }
     LOG_INFO(
         Input,
         "[DMC TRACE] Script assignment observer installed; cleanup identification is provisional");
