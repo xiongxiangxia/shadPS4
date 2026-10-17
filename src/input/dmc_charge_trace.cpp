@@ -111,16 +111,69 @@ struct CachedAssignment {
     bool matched = false;
     bool cleanup = false;
     bool reported = false;
+    bool action_candidate = false;
+};
+
+struct WatchedAction {
+    u64 object = 0;
+    u64 start_name = 0;
+    u32 probes = 0;
+    u32 records = 0;
 };
 
 struct ProbeCache {
     u64 generation = 0;
     u32 discoveries = 0;
     u32 records = 0;
+    bool watch_limit_reported = false;
+    std::array<WatchedAction, 16> actions{};
     std::array<CachedAssignment, 4096> sites{};
 };
 
 thread_local ProbeCache probe_cache;
+
+void ResetCaptureCache() {
+    const u64 generation = capture_generation.load(std::memory_order_relaxed);
+    if (probe_cache.generation != generation) {
+        probe_cache = {};
+        probe_cache.generation = generation;
+    }
+}
+
+WatchedAction* FindAction(void* object) {
+    if (object == nullptr) {
+        return nullptr;
+    }
+    for (auto& action : probe_cache.actions) {
+        if (action.object == reinterpret_cast<u64>(object)) {
+            return &action;
+        }
+    }
+    return nullptr;
+}
+
+void WatchAction(void* object, void* frame, const Assignment& assignment, bool cleanup) {
+    if (object == nullptr || FindAction(object) != nullptr) {
+        return;
+    }
+    for (auto& action : probe_cache.actions) {
+        if (action.object == 0) {
+            const u64 node = LiveWord(reinterpret_cast<u64>(frame) + 0x18);
+            action.object = reinterpret_cast<u64>(object);
+            action.start_name = !cleanup && node != 0 ? Word(node + 0x48) : 0;
+            PadTrace::Record("DMC_ACTION_WATCH",
+                             {reinterpret_cast<s64>(object), static_cast<s64>(node),
+                              static_cast<s64>(assignment.owner_property),
+                              static_cast<s64>(assignment.property), cleanup,
+                              static_cast<s64>(action.start_name)});
+            return;
+        }
+    }
+    if (!probe_cache.watch_limit_reported) {
+        probe_cache.watch_limit_reported = true;
+        PadTrace::Record("DMC_WATCH_LIMIT", {16});
+    }
+}
 
 u64 Operand(void* frame) {
     u64 code = 0;
@@ -133,11 +186,7 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     if (!PadTrace::Enabled()) {
         return handler(object, frame, result);
     }
-    const u64 generation = capture_generation.load(std::memory_order_relaxed);
-    if (probe_cache.generation != generation) {
-        probe_cache = {};
-        probe_cache.generation = generation;
-    }
+    ResetCaptureCache();
     if (probe_cache.records >= 4096) {
         return handler(object, frame, result);
     }
@@ -150,16 +199,25 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
         site.matched =
             code != 0 && operand[0] == 0x19 && operand[1] == 0x01 && Decode(code, site.assignment);
         site.cleanup = site.matched && IsCleanupCandidate(code, site.assignment);
+        Assignment next;
+        site.action_candidate = site.matched && site.assignment.value == 0x3f800000 &&
+                                Decode(code + 36, next) && next.value == 0x3f800000 &&
+                                next.owner_property == site.assignment.owner_property &&
+                                next.property != site.assignment.property;
     }
     const Assignment assignment = site.assignment;
     const bool cleanup = site.cleanup;
     if (cleanup) {
         charge_property.store(assignment.property, std::memory_order_relaxed);
     }
+    if (cleanup || site.action_candidate) {
+        WatchAction(object, frame, assignment, cleanup);
+    }
     const bool tracked =
         site.matched && assignment.property == charge_property.load(std::memory_order_relaxed);
     const bool discovery = site.matched && !site.reported && probe_cache.discoveries < 128;
-    const bool matched = site.matched && probe_cache.records < 4096;
+    const bool matched = site.matched && (FindAction(object) != nullptr || discovery || tracked) &&
+                         probe_cache.records < 4096;
     const u64 request = matched ? PadTrace::NextId() : 0;
     if (matched) {
         ++probe_cache.records;
@@ -197,6 +255,7 @@ void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
 
 struct BranchSite {
     u64 code = 0;
+    u64 object = 0;
     bool matched = false;
     bool reported = false;
     u64 next = 0;
@@ -204,8 +263,6 @@ struct BranchSite {
 
 struct BranchCache {
     u64 generation = 0;
-    u32 probes = 0;
-    u32 records = 0;
     std::array<BranchSite, 4096> sites{};
 };
 
@@ -216,45 +273,57 @@ void PS4_SYSV_ABI ObserveJump(void* object, void* frame, void* result) {
     if (!PadTrace::Enabled()) {
         return handler(object, frame, result);
     }
+    ResetCaptureCache();
+    auto* action = FindAction(object);
+    if (action == nullptr || action->records >= 512) {
+        return handler(object, frame, result);
+    }
     const u64 generation = capture_generation.load(std::memory_order_relaxed);
     if (branch_cache.generation != generation) {
         branch_cache = {};
         branch_cache.generation = generation;
     }
     const u64 code = Operand(frame);
-    auto& site = branch_cache.sites[(code >> 2) % branch_cache.sites.size()];
-    if (site.code != code && branch_cache.probes < 1024) {
-        ++branch_cache.probes;
+    const u64 object_address = reinterpret_cast<u64>(object);
+    auto& site = branch_cache.sites[((code >> 2) ^ (code >> 15) ^ (object_address >> 4)) %
+                                    branch_cache.sites.size()];
+    if ((site.code != code || site.object != object_address) && action->probes < 256) {
+        ++action->probes;
         site = {};
         site.code = code;
+        site.object = object_address;
         const auto* expression = reinterpret_cast<const u8*>(code + 2);
         site.matched = code != 0 && expression[0] == 0x19 &&
                        (expression[1] == 0x01 || (expression[1] == 0x19 && expression[2] == 0x01));
-        if (branch_cache.probes == 1024) {
-            PadTrace::Record("DMC_BRANCH_LIMIT", {branch_cache.probes, branch_cache.records});
+        if (action->probes == 256) {
+            PadTrace::Record("DMC_BRANCH_LIMIT",
+                             {action->probes, action->records, static_cast<s64>(object_address)});
         }
     }
-    const bool matched = site.code == code && site.matched && branch_cache.records < 512;
+    const bool matched = site.code == code && site.object == object_address && site.matched;
     const u64 node = matched ? LiveWord(reinterpret_cast<u64>(frame) + 0x18) : 0;
     handler(object, frame, result);
     if (!matched) {
         return;
     }
     const u64 next = Operand(frame);
-    if (site.code != code) {
+    if (site.code != code || site.object != object_address) {
         return;
     }
-    if (!site.reported || site.next != next) {
+    const bool start =
+        node != 0 && action->start_name != 0 && LiveWord(node + 0x48) == action->start_name;
+    if (!site.reported || site.next != next || start) {
         const bool first = !site.reported;
+        const bool changed = site.reported && site.next != next;
         site.reported = true;
         site.next = next;
-        ++branch_cache.records;
+        ++action->records;
         const u64 request = PadTrace::NextId();
         PadTrace::Record("DMC_BRANCH", {static_cast<s64>(request), reinterpret_cast<s64>(object),
                                         reinterpret_cast<s64>(frame), static_cast<s64>(node),
-                                        static_cast<s64>(code), static_cast<s64>(next), !first,
-                                        first, branch_cache.probes, branch_cache.records});
-        if (first && branch_cache.records <= 64) {
+                                        static_cast<s64>(code), static_cast<s64>(next), changed,
+                                        first, action->probes, action->records, start});
+        if (first && action->records <= 64) {
             FrameSite(request, frame);
             std::array<u64, 4> words{};
             if (Read(code, words.data(), sizeof(words))) {
@@ -264,8 +333,9 @@ void PS4_SYSV_ABI ObserveJump(void* object, void* frame, void* result) {
                                   static_cast<s64>(words[3])});
             }
         }
-        if (branch_cache.records == 512) {
-            PadTrace::Record("DMC_BRANCH_LIMIT", {branch_cache.probes, branch_cache.records});
+        if (action->records == 512) {
+            PadTrace::Record("DMC_BRANCH_LIMIT",
+                             {action->probes, action->records, static_cast<s64>(object_address)});
         }
     }
 }

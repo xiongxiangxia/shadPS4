@@ -31,9 +31,10 @@ be confirmed from runtime data before treating the first property as m_fcpGunCha
 
 The low-overhead revision removes virtual/final call hooks. Assignment decoding, including
 negative results, is cached per thread and operand address, reset on each F9 capture start.
-This assumes script bytecode stays immutable during a capture. All matching contextual float
-0/1 assignments are recorded, including repeated writes, with a hard limit of 4096 assignment
-pairs per thread per capture (`DMC_PROBE_LIMIT`). Current-frame snapshots are limited to 128
+This assumes script bytecode stays immutable during a capture. Matching contextual float 0/1
+assignments in watched objects, and identified candidate-property writes, include repeated
+writes. Other objects contribute only discovery sites, capped at 128 per thread. There is a
+hard limit of 4096 assignment pairs per thread per capture (`DMC_PROBE_LIMIT`). Snapshots use 128
 discovery sites. Operand/frame reads use live interpreter objects; read-back is directly copied
 only when the interpreter's destination is nonzero and property metadata matches. Cold decoding
 and provisional node metadata still use checked reads. These probes assume the native handler's
@@ -47,16 +48,31 @@ No gameplay repair is included.
 token 0x07 only when its dispatch pointer is within the matching game's code image and its
 member-function adjustment is zero. It delegates to the original handler without changing its
 arguments or branch decisions. The initial contextual-condition prefix is read from live code.
-Per-thread decoding is capped at 1024 cache misses; branch events are capped at 512 per capture,
-with `DMC_BRANCH_LIMIT` emitted at either limit. The broad contextual-prefix filter is discovery,
-not a confirmed charge-condition filter. Native action-graph decisions can bypass this opcode.
+Only watched objects reach branch decoding; unrelated script objects do not consume its budget.
+Each watched object has its own 256-cache-miss/512-event limits per thread and capture, reported
+by `DMC_BRANCH_LIMIT` (misses, events, object). Cache keys include both operand and object.
+The contextual-prefix filter remains discovery, not a confirmed charge-condition filter.
+Native action-graph decisions and decisions made by other objects can bypass these probes.
+
+`DMC_ACTION_WATCH`: object, seed node, owner-property metadata, property metadata, cleanup-seed
+flag, seed-node FName bits (zero for cleanup seeds). An object is watched after a cleanup-pattern
+match or two adjacent contextual assignments of 1.0 to different properties of the same owner.
+This matches observed RangedAttack/RangedCharge setup sequences but is NOT a unique identity
+test. Up to 16 objects are watched per thread/capture (`DMC_WATCH_LIMIT` on overflow). Discovery
+starts during assignment execution, so earlier branches of the first action invocation are
+absent. Start with one successful charge to prime these filters. Later invocations that reuse
+the same objects can be compared. New/replaced objects may require rediscovery; pointer reuse
+and the provisional object layouts limit the interpretation.
 
 `DMC_BRANCH`: request, object, frame, node, operand before evaluation, operand after evaluation,
-changed-from-previous-outcome flag, first-observation flag, cache-miss count, event count.
-Only first observations and changed post-evaluation pointers are recorded. The pointer change
+changed-from-previous-outcome flag, first-observation flag, object cache-miss count, object event
+count, seed-name-match flag. First observations and changed post-evaluation pointers are recorded.
+Branches in functions sharing the setup seed's FName are recorded on every execution to retain
+repeated starts, including inherited functions. This is a candidate lifecycle marker, not a
+validated function-name resolution. The pointer change
 is raw control-flow evidence, NOT an already decoded true/false condition or cancellation reason.
-Compare against the function's bytecode before interpreting its direction. Repeated identical
-outcomes and different objects at the same site may be omitted. For the first 64 recorded events,
+Compare against the function's bytecode before interpreting its direction. Other repeated
+identical outcomes may be omitted. For the first 64 recorded events of each watched object,
 new sites include a current-frame snapshot and `DMC_BRANCH_CODE` (request, four raw u64 words
 starting at the pre-evaluation operand) to help associate the condition with static scripts.
 
