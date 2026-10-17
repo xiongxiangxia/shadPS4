@@ -22,8 +22,13 @@ namespace {
 using Native = void(PS4_SYSV_ABI*)(void*, void*, void*);
 using HeldNative = u32(PS4_SYSV_ABI*)(void*, u32);
 using ClearNative = u32(PS4_SYSV_ABI*)(void*, void*);
+using AggregateEvent = u32(PS4_SYSV_ABI*)(void*, void*, u32);
+using AggregateOperation = void(PS4_SYSV_ABI*)(void*);
 HeldNative native_held = nullptr;
 ClearNative native_clear = nullptr;
+AggregateEvent native_aggregate_event = nullptr;
+AggregateOperation native_aggregate_clear = nullptr;
+AggregateOperation native_aggregate_flush = nullptr;
 std::atomic<Native> original;
 std::atomic<Native> original_jump;
 std::atomic<u64> charge_property{0};
@@ -208,6 +213,8 @@ struct NativeCache {
     u64 generation = 0;
     u32 held_records = 0;
     u32 clear_records = 0;
+    std::array<u32, 4> aggregate_records{};
+    u64 aggregate_request = 0;
     std::array<HeldSample, 128> held{};
 };
 
@@ -287,6 +294,119 @@ u32 PS4_SYSV_ABI ObserveClear(void* object, void* event) {
         PadTrace::Record("DMC_NATIVE_LIMIT", {1, 1024});
     }
     return result;
+}
+
+bool AggregateBudget(u32 kind) {
+    ResetNativeCache();
+    constexpr std::array<u32, 4> limits{512, 1024, 256, 256};
+    auto& count = native_cache.aggregate_records[kind];
+    if (count >= limits[kind]) {
+        return false;
+    }
+    ++count;
+    if (count == limits[kind]) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {kind + 2, count});
+    }
+    return true;
+}
+
+void AggregateState(const char* kind, u64 request, void* object, void* event, u32 mode, u64 caller,
+                    u32 result = 0) {
+    const u64 address = reinterpret_cast<u64>(object);
+    PadTrace::Record(
+        kind, {static_cast<s64>(request), static_cast<s64>(address), reinterpret_cast<s64>(event),
+               mode, LiveDword(address + 0x80), static_cast<s64>(LiveWord(address + 0xa0)),
+               static_cast<s64>(LiveWord(address + 0xa8)), LiveDword(address + 0xb0),
+               LiveDword(address + 0xc0), LiveDword(address + 0xd0), LiveDword(address + 0xd8),
+               static_cast<s64>(caller), result, static_cast<s64>(native_cache.aggregate_request)});
+}
+
+class AggregateScope {
+public:
+    explicit AggregateScope(u64 request) : previous{native_cache.aggregate_request} {
+        native_cache.aggregate_request = request;
+    }
+    ~AggregateScope() {
+        native_cache.aggregate_request = previous;
+    }
+
+private:
+    u64 previous;
+};
+
+void AggregateContext(u64 request, void* event) {
+    if (event == nullptr || guest_base == 0) {
+        return;
+    }
+    const u64 address = reinterpret_cast<u64>(event);
+    const u64 input_class = LiveWord(guest_base + 0x3b193f8);
+    const u64 event_class = LiveWord(address + 0x50);
+    bool input = false;
+    for (u64 parent = event_class, depth = 0; input_class != 0 && parent != 0 && depth < 16;
+         ++depth) {
+        if (parent == input_class) {
+            input = true;
+            break;
+        }
+        const u64 next = LiveWord(parent + 0x68);
+        if (next == parent) {
+            break;
+        }
+        parent = next;
+    }
+    const u32 type = input ? *reinterpret_cast<const u8*>(address + 0x78) : 0;
+    const u32 held = input ? LiveDword(address + 0xa0) : 0;
+    PadTrace::Record("DMC_AGG_CONTEXT",
+                     {static_cast<s64>(request), static_cast<s64>(address),
+                      static_cast<s64>(event_class), input, type, held,
+                      static_cast<s64>(LiveWord(address + 0x60)),
+                      static_cast<s64>(LiveWord(address + 0x68)),
+                      static_cast<s64>(LiveWord(address + 0x70)), static_cast<s64>(input_class)});
+}
+
+u32 PS4_SYSV_ABI ObserveAggregateEvent(void* object, void* event, u32 input) {
+    if (!PadTrace::Enabled() || !AggregateBudget(input != 0 ? 0 : 1)) {
+        return native_aggregate_event(object, event, input);
+    }
+    const u64 request = PadTrace::NextId();
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    AggregateState("DMC_AGG_EVENT_BEGIN", request, object, event, input, caller);
+    AggregateContext(request, event);
+    u32 result = 0;
+    {
+        const AggregateScope scope{request};
+        result = native_aggregate_event(object, event, input);
+    }
+    AggregateState("DMC_AGG_EVENT_END", request, object, event, input, caller, result);
+    return result;
+}
+
+void PS4_SYSV_ABI ObserveAggregateClear(void* object) {
+    if (!PadTrace::Enabled() || !AggregateBudget(2)) {
+        return native_aggregate_clear(object);
+    }
+    const u64 request = PadTrace::NextId();
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    AggregateState("DMC_AGG_CLEAR_BEGIN", request, object, nullptr, 0, caller);
+    {
+        const AggregateScope scope{request};
+        native_aggregate_clear(object);
+    }
+    AggregateState("DMC_AGG_CLEAR_END", request, object, nullptr, 0, caller);
+}
+
+void PS4_SYSV_ABI ObserveAggregateFlush(void* object) {
+    if (!PadTrace::Enabled() || !AggregateBudget(3)) {
+        return native_aggregate_flush(object);
+    }
+    const u64 request = PadTrace::NextId();
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    AggregateState("DMC_AGG_FLUSH_BEGIN", request, object, nullptr, 0, caller);
+    {
+        const AggregateScope scope{request};
+        native_aggregate_flush(object);
+    }
+    AggregateState("DMC_AGG_FLUSH_END", request, object, nullptr, 0, caller);
 }
 
 void AbsoluteJump(u8* output, u64 target) {
@@ -493,7 +613,8 @@ void PS4_SYSV_ABI ObserveJump(void* object, void* frame, void* result) {
 } // namespace
 
 void InstallNative() {
-    if (native_held != nullptr || native_clear != nullptr ||
+    if (native_held != nullptr || native_clear != nullptr || native_aggregate_event != nullptr ||
+        native_aggregate_clear != nullptr || native_aggregate_flush != nullptr ||
         Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;
@@ -506,6 +627,7 @@ void InstallNative() {
     if (base == 0) {
         return;
     }
+    guest_base = base;
     constexpr char held_name[] = "UNTInputexecIsHeld";
     constexpr char clear_name[] = "UNTActionGraph_NodeexecClearBufferedInput";
     std::array<char, sizeof(held_name)> held_registration{};
@@ -525,13 +647,33 @@ void InstallNative() {
         NativeEntry(base + 0x91d750, reinterpret_cast<u64>(&ObserveHeld), held_bytes));
     native_clear = reinterpret_cast<ClearNative>(
         NativeEntry(base + 0xa21c90, reinterpret_cast<u64>(&ObserveClear), clear_bytes));
+    constexpr std::array<u8, 17> event_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                             0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+    constexpr std::array<u8, 17> aggregate_clear_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56,
+                                                       0x53, 0x49, 0x89, 0xfe, 0x41, 0x8b,
+                                                       0x86, 0x80, 0x00, 0x00, 0x00};
+    constexpr std::array<u8, 20> flush_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                             0x56, 0x53, 0x50, 0x48, 0x89, 0xfb, 0x83,
+                                             0xbb, 0x80, 0x00, 0x00, 0x00, 0x00};
+    native_aggregate_event = reinterpret_cast<AggregateEvent>(
+        NativeEntry(base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), event_bytes));
+    native_aggregate_clear = reinterpret_cast<AggregateOperation>(NativeEntry(
+        base + 0xa1f5d0, reinterpret_cast<u64>(&ObserveAggregateClear), aggregate_clear_bytes));
+    native_aggregate_flush = reinterpret_cast<AggregateOperation>(
+        NativeEntry(base + 0xa1f220, reinterpret_cast<u64>(&ObserveAggregateFlush), flush_bytes));
     LOG_INFO(Input, "[DMC TRACE] Native probes before guest execution: held={}, node_clear={}",
              native_held != nullptr, native_clear != nullptr);
+    LOG_INFO(Input, "[DMC TRACE] Aggregator probes: event={}, clear={}, flush={}",
+             native_aggregate_event != nullptr, native_aggregate_clear != nullptr,
+             native_aggregate_flush != nullptr);
 }
 
 void Install() {
     capture_generation.fetch_add(1, std::memory_order_relaxed);
     PadTrace::Record("DMC_NATIVE_HOOK", {native_held != nullptr, native_clear != nullptr});
+    PadTrace::Record("DMC_AGG_HOOK",
+                     {native_aggregate_event != nullptr, native_aggregate_clear != nullptr,
+                      native_aggregate_flush != nullptr});
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;

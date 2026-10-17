@@ -4,7 +4,7 @@
 
 ### Native held-input and buffer-clear probes
 
-The native extension installs two version-specific entry detours after loading eboot and before
+The native extension installs version-specific entry detours after loading eboot and before
 Linker::Execute starts guest execution. It does not install entry detours while F9 recording is
 running. Serial, app version, native registration strings and all displaced entry bytes are
 checked; mismatches leave the affected entry unchanged.
@@ -13,14 +13,14 @@ IsHeld at eboot+0x91d750 (14 bytes), Node.ClearBufferedInput at eboot+0xa21c90 (
 Each delegates to an executable trampoline containing the original instructions, followed by an
 absolute jump back. Trampoline memory stays allocated for process lifetime. Game files are unchanged.
 This still changes in-process execution and introduces overhead; runtime validation is required.
-Set `SHADPS4_DMC_NATIVE=0` before launching to skip both native detours. Baseline builds omit them.
+Set `SHADPS4_DMC_NATIVE=0` before launching to skip all native detours. Baseline builds omit them.
 
 The registered UNTInputexecIsHeld wrapper calls 0x91d750; that function tests object+0x220.
 UNTInputexecGetHeldTime calls 0x91d7a0, which uses timestamps at object+0x228+button*4.
 UNTActionGraph_NodeexecClearBufferedInput calls 0xa21c90. Registration-string relocations and
 wrapper disassembly associate these names with the entrypoints; names alone are not the evidence.
 Native IsHeld calls can be inlined or bypassed. An absent event does not mean the game saw release.
-Other buffer-clearing paths, including direct aggregator calls, are NOT yet hooked.
+Other buffer-clearing paths may still bypass these entrypoints, including inlined implementations.
 
 `DMC_NATIVE_HOOK`: held-entry installed flag, node-clear-entry installed flag, emitted at F9 start.
 Startup also logs each installation result to shad_log.txt, even when recording is initially off.
@@ -40,6 +40,41 @@ the call; no deep pointer traversal is performed. Events may be nested. A clear 
 itself proof of an incorrect cancellation or identification of the charged weapon's request.
 Node-clear event pairs are capped at 1024 per thread/capture. `DMC_NATIVE_LIMIT` reports kind
 (0 held, 1 clear) and limit. F9 capture starts reset the per-thread budgets.
+
+### Native input aggregator probes
+
+The aggregator class registration references its native constructor at eboot+0x212fb20, which
+installs vtable eboot+0x31fca70. Relocated vtable entries identify InputEvent (+0x248, 0xa1f970),
+InternalEvent (+0x250, 0xa1fe00), ClearBufferedInput (+0x260, 0xa1f5d0), and Global_BufferFlush
+(+0x268, 0xa1f220). InputEvent/InternalEvent tail-jump to 0xa1f980 with third argument 1/0.
+That shared entry (17 bytes), ClearBufferedInput (17 bytes), and Global_BufferFlush (20 bytes)
+are detoured before guest execution with exact displaced-byte checks. These instruction prefixes
+are complete and have no relative operands. `DMC_AGG_HOOK` reports installation flags in that order;
+the common log also reports each flag at startup. Original arguments/results are preserved.
+
+`DMC_AGG_EVENT_BEGIN/END`, `DMC_AGG_CLEAR_BEGIN/END`, `DMC_AGG_FLUSH_BEGIN/END` share this layout:
+request, aggregator, event pointer (zero for clear/flush), input-mode argument (zero for clear/flush),
+buffer count at +0x80, buffered-context pointer at +0xa0, opaque active pointer at +0xa8,
+raw flags word at +0xb0, pending count +0xc0, flush count +0xd0, internal-event counter +0xd8,
+native caller return address, original result (END of EVENT only), parent request.
+Pointer/count roles are inferred from implementation use; exact ownership and state meanings are
+not fully decoded. Parent request correlates nested observed calls on the same thread only.
+The original return value alone does NOT prove a charge request was accepted or consumed.
+
+`DMC_AGG_CONTEXT`: request, event, event class, matched-input-class flag, button-event-type byte,
+held-mask word, raw event words at +0x60/+0x68/+0x70, cached expected-input-class pointer.
+The input class check follows UObject class (+0x50) / superclass (+0x68), bounded to 16 links,
+against the class cached at eboot+0x3b193f8 by ADVPlayerController.CreateInputEvent (0xb0c170).
+That function stores its Type argument at event+0x78 and the return of DVInput.GetDVButtonsHeld
+(0xb011e0) at event+0xa0. Those two fields are read only after the class check succeeds. Raw
+event words are not yet resolved into input names. Type enum values and DV held-mask bit indices
+must be correlated with known button events; they are not necessarily the NTInput or scePad indices.
+No event is dereferenced after the original handler returns, because pooling may reuse it.
+Live object/class reads assume the validated runtime layouts and object lifetime hold.
+
+Input events, internal events, clears, and flushes have separate per-thread/capture budgets of
+512, 1024, 256, 256 pairs. DMC_NATIVE_LIMIT kind 2/3/4/5 identifies the exhausted budget. All probes
+remain diagnostic and timing-sensitive. No buffering, animation, or emulation repair is included.
 
 ### Script probes
 

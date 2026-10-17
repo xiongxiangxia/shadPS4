@@ -52,6 +52,9 @@ def summarize(path):
     dmc_total = 0
     dmc_branches = []
     dmc_probe_limits = []
+    aggregate_pending = {}
+    aggregate_calls = []
+    aggregate_contexts = []
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -86,6 +89,7 @@ def summarize(path):
                 frame_previous.clear()
                 waits.clear()
                 dmc_pending.clear()
+                aggregate_pending.clear()
                 markers.append({"recording": bool(p[0]), "monotonic_us": timestamp})
             elif kind == "CLOCK":
                 key = (row["thread"], p[0], p[7], p[8])
@@ -114,6 +118,30 @@ def summarize(path):
                 wait_timeouts += p[2] == 0
             elif kind == "READ_STATE":
                 read_callers[hex(p[2])] += 1
+            elif kind in ("DMC_AGG_EVENT_BEGIN", "DMC_AGG_CLEAR_BEGIN", "DMC_AGG_FLUSH_BEGIN"):
+                aggregate_pending[p[0]] = (timestamp, kind, p)
+            elif kind == "DMC_AGG_CONTEXT":
+                if len(aggregate_contexts) < 100:
+                    aggregate_contexts.append({
+                        "request": p[0], "event": hex(p[1]), "class": hex(p[2]),
+                        "input_class_matches": bool(p[3]), "type_raw": p[4],
+                        "held_mask_raw": hex(p[5]), "event_words_raw": [hex(v) for v in p[6:9]],
+                    })
+            elif kind in ("DMC_AGG_EVENT_END", "DMC_AGG_CLEAR_END", "DMC_AGG_FLUSH_END"):
+                began = aggregate_pending.pop(p[0], None)
+                if began and len(aggregate_calls) < 100:
+                    before, operation, source = began
+                    aggregate_calls.append({
+                        "monotonic_us": before, "operation": operation,
+                        "request": p[0], "parent_request": source[13],
+                        "aggregator": hex(source[1]), "event": hex(source[2]),
+                        "mode_raw": source[3], "caller": hex(source[11]),
+                        "duration_us": timestamp - before, "result_raw": p[12],
+                        "buffer_count_before_after": [source[4], p[4]],
+                        "context_before_after": [hex(source[5]), hex(p[5])],
+                        "pending_before_after": [source[8], p[8]],
+                        "flush_count_before_after": [source[9], p[9]],
+                    })
             elif kind == "DMC_LET_BEGIN":
                 dmc_pending[p[0]] = (timestamp, p)
             elif kind == "DMC_BRANCH":
@@ -204,6 +232,8 @@ def summarize(path):
         "routing_filters": dict(filters),
         "read_state_callers": dict(read_callers),
         "dmc_assignment_count": dmc_total,
+        "dmc_aggregate_calls_first_100": aggregate_calls,
+        "dmc_aggregate_contexts_first_100": aggregate_contexts,
         "dmc_branches_first_100": dmc_branches,
         "dmc_probe_limits": dmc_probe_limits,
         "dmc_assignments_first_100": dmc_assignments,
