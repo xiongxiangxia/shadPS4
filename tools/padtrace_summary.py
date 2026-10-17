@@ -55,6 +55,13 @@ def summarize(path):
     aggregate_pending = {}
     aggregate_calls = []
     aggregate_contexts = []
+    handoff_calls = {}
+    handoffs = []
+    buffer_states = []
+    buffer_items = []
+    graph_states = []
+    objects = {}
+    name_chunks = collections.defaultdict(dict)
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -118,6 +125,35 @@ def summarize(path):
                 wait_timeouts += p[2] == 0
             elif kind == "READ_STATE":
                 read_callers[hex(p[2])] += 1
+            elif kind == "DMC_NAME":
+                raw = b"".join((v & ((1 << 64) - 1)).to_bytes(8, "little") for v in p[4:16])
+                name_chunks[(p[0], bool(p[1]))][p[2]] = raw[:max(0, min(p[3], 96))]
+            elif kind == "DMC_OBJECT":
+                packed = p[2] & ((1 << 64) - 1)
+                objects[hex(p[1])] = {"name_index": packed & 0xffffffff,
+                                      "name_number": packed >> 32,
+                                      "class": hex(p[3]), "outer": hex(p[4]),
+                                      "vtable": hex(p[5])}
+            elif kind in ("DMC_BUFFER_CALL", "DMC_GRAPH_CALL", "DMC_MATCH_CALL", "DMC_SELECT_CALL"):
+                handoff_calls[p[0]] = {"request": p[0], "parent": p[1], "kind": kind,
+                                       "monotonic_us": timestamp, "arguments_raw": p[2:8]}
+            elif kind == "DMC_HANDOFF_END":
+                began = handoff_calls.pop(p[0], None)
+                if began and len(handoffs) < 2000:
+                    began.update(result_raw=p[2], duration_us=timestamp - began["monotonic_us"])
+                    handoffs.append(began)
+            elif kind == "DMC_BUFFER" and len(buffer_states) < 2000:
+                buffer_states.append({"request": p[0], "phase": p[1],
+                                      "monotonic_us": timestamp, "buffer": hex(p[2]),
+                                      "count": p[3], "policy_raw": p[4], "owner": hex(p[5])})
+            elif kind == "DMC_BUFFER_ITEM" and len(buffer_items) < 2000:
+                buffer_items.append({"request": p[0], "phase": p[1], "index": p[2],
+                                     "event": hex(p[3]), "descriptor": hex(p[4]),
+                                     "raw_68_6c": p[5:7], "class": hex(p[7])})
+            elif kind == "DMC_GRAPH" and len(graph_states) < 2000:
+                graph_states.append({"request": p[0], "phase": p[1], "graph": hex(p[2]),
+                                     "root": hex(p[3]), "node": hex(p[4]),
+                                     "raw_flags_state_sets": p[5:10]})
             elif kind in ("DMC_AGG_EVENT_BEGIN", "DMC_AGG_CLEAR_BEGIN", "DMC_AGG_FLUSH_BEGIN"):
                 aggregate_pending[p[0]] = (timestamp, kind, p)
             elif kind == "DMC_AGG_CONTEXT":
@@ -138,7 +174,7 @@ def summarize(path):
                         "mode_raw": source[3], "caller": hex(source[11]),
                         "duration_us": timestamp - before, "result_raw": p[12],
                         "buffer_count_before_after": [source[4], p[4]],
-                        "context_before_after": [hex(source[5]), hex(p[5])],
+                        "owner_before_after": [hex(source[5]), hex(p[5])],
                         "pending_before_after": [source[8], p[8]],
                         "flush_count_before_after": [source[9], p[9]],
                     })
@@ -225,6 +261,12 @@ def summarize(path):
         finish = bisect.bisect_left(times, pulse["release_sample_us"])
         pulse["returned_samples_during_hold"] = finish - begin
     missed = [pulse for pulse in pulses if not pulse["returned_samples_during_hold"]]
+    names = {index: b"".join(chunks[offset] for offset in sorted(chunks)).decode(
+        "utf-16-le" if wide else "latin-1", errors="replace")
+        for (index, wide), chunks in name_chunks.items()}
+    for obj in objects.values():
+        obj["name"] = names.get(obj["name_index"])
+
     return {
         "revision": revision,
         "duration_seconds": (end - start) / 1000000 if start is not None else 0,
@@ -234,6 +276,11 @@ def summarize(path):
         "dmc_assignment_count": dmc_total,
         "dmc_aggregate_calls_first_100": aggregate_calls,
         "dmc_aggregate_contexts_first_100": aggregate_contexts,
+        "dmc_objects": objects,
+        "dmc_handoffs_first_2000": handoffs,
+        "dmc_buffers_first_2000": buffer_states,
+        "dmc_buffer_items_first_2000": buffer_items,
+        "dmc_graphs_first_2000": graph_states,
         "dmc_branches_first_100": dmc_branches,
         "dmc_probe_limits": dmc_probe_limits,
         "dmc_assignments_first_100": dmc_assignments,

@@ -54,7 +54,7 @@ the common log also reports each flag at startup. Original arguments/results are
 
 `DMC_AGG_EVENT_BEGIN/END`, `DMC_AGG_CLEAR_BEGIN/END`, `DMC_AGG_FLUSH_BEGIN/END` share this layout:
 request, aggregator, event pointer (zero for clear/flush), input-mode argument (zero for clear/flush),
-buffer count at +0x80, buffered-context pointer at +0xa0, opaque active pointer at +0xa8,
+buffer count at +0x80, opaque buffer-owner pointer at +0xa0, opaque active pointer at +0xa8,
 raw flags word at +0xb0, pending count +0xc0, flush count +0xd0, internal-event counter +0xd8,
 native caller return address, original result (END of EVENT only), parent request.
 Pointer/count roles are inferred from implementation use; exact ownership and state meanings are
@@ -75,6 +75,59 @@ Live object/class reads assume the validated runtime layouts and object lifetime
 Input events, internal events, clears, and flushes have separate per-thread/capture budgets of
 512, 1024, 256, 256 pairs. DMC_NATIVE_LIMIT kind 2/3/4/5 identifies the exhausted budget. All probes
 remain diagnostic and timing-sensitive. No buffering, animation, or emulation repair is included.
+
+### Correlated action/buffer handoff probes
+
+Static inspection of DevilGame.xxx identifies DVPlayerController_Player.PlayerTick assigning
+m_ConsumedHeldInput_RangedAttack from SendActionGraphEvent(RangedAttack, Held), gated by
+m_OnlyConsumeHeldInputsOnce. An acknowledged buffered event can therefore stop further Held
+submissions without proving that a charge action has started. This is game logic, not evidence
+that the emulator's handling differs from hardware. Do not change the consumption flag blindly.
+
+Additional entry detours at 0xa1c3c0 (buffer event), 0xa1fe10 (graph event), 0xa26420 (event
+descriptor/conditions match), and 0xa20850 (link selection) preserve all arguments and results.
+They record only while nested under an observed aggregator call, clear, or flush. All displaced
+17-byte prefixes are complete instructions without relative operands. The buffer owner argument
+may be a node OR a graph, depending on the call site; +0xa0 is not an event-context pointer.
+The shared event path and buffer helper can replace or clear entries inline without entering
+the previously monitored ClearBufferedInput functions.
+
+`DMC_HANDOFF_HOOK`: four installed flags in the order above. Limits per thread/capture are
+2048 buffer calls and 4096 calls each for graph, match, and selection; DMC_NATIVE_LIMIT kinds
+6/7/8/9 report exhaustion. Parent request IDs form a same-thread call tree. Work outside that
+tree is not observed; absence of a record is not proof of absence of execution.
+
+`DMC_BUFFER_CALL`: request, parent request, buffer structure, owner argument, event, first
+candidate set, second candidate set, native caller. `DMC_GRAPH_CALL`: request, parent, graph,
+event, caller. `DMC_MATCH_CALL`: request, parent, rule, event, expected event descriptor,
+condition count, caller. `DMC_SELECT_CALL`: request, parent, set, event, link count, condition
+count, caller. `DMC_HANDOFF_END`: request, operation kind (0/1/2/3), original result; selection
+returns a link pointer rather than a boolean.
+
+`DMC_BUFFER`: request, phase (0 before, 1 after), buffer structure, count, raw policy word,
+opaque owner, array pointer. `DMC_BUFFER_ITEM`: request, phase, item index, event pointer,
+event descriptor (+0x60), raw +0x68/+0x6c words, event class. At most eight live pending entries
+are read per snapshot; count remains uncapped so truncation is visible. Aggregator event
+entry/exit also takes these snapshots, covering inline replacement outside the buffer helper.
+
+`DMC_GRAPH`: request, phase, graph, root set (+0x60), active node (+0x88), raw graph flags
+(+0x90), node state (+0xd0), node flags (+0xb4), node sets (+0x80/+0x88). A zero active node
+does not by itself imply failure. `DMC_CONDITION_FIELDS`: request, condition, index, native
+predicate address, copied byte count, four raw words starting at +0x60. Only predicates whose
+native targets match 0xb73310 (DV common, 32 bytes) or 0xa232a0 (NT common, 8 bytes) are copied;
+other conditions are identified but not evaluated or interpreted by the logger.
+
+`DMC_OBJECT`: request, object, packed FName, class, outer, vtable. Identities are cached in 512
+direct-mapped slots, capped at 1024 records per thread/capture. Object reuse or slot collisions
+may make the dictionary incomplete. `DMC_NAME`: FName index, wide flag, byte offset, valid byte
+count, twelve little-endian 64-bit chunks. Decode as UTF-16LE if wide, otherwise the game's
+8-bit name encoding; at most 192 bytes are copied per name. FName number is retained in the
+upper 32 bits of DMC_OBJECT's packed name, not appended to dictionary strings. The name table
+at eboot+0x3984330, entry flag bit zero, and string offset +0x10 come from FName::ToString at
+0xb4bb0; reads are bounded and checked without calling game allocation or string functions.
+
+Identity/condition traversal adds overhead and must still be validated in game. This change
+does not add globally dispatched VM call tracing, held-event replay, or an unproven repair.
 
 ### Script probes
 

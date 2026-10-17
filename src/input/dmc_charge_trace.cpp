@@ -24,11 +24,18 @@ using HeldNative = u32(PS4_SYSV_ABI*)(void*, u32);
 using ClearNative = u32(PS4_SYSV_ABI*)(void*, void*);
 using AggregateEvent = u32(PS4_SYSV_ABI*)(void*, void*, u32);
 using AggregateOperation = void(PS4_SYSV_ABI*)(void*);
+using BufferEvent = u32(PS4_SYSV_ABI*)(void*, void*, void*, void*, void*);
+using GraphEvent = u32(PS4_SYSV_ABI*)(void*, void*);
+using SelectLink = void*(PS4_SYSV_ABI*)(void*, void*);
 HeldNative native_held = nullptr;
 ClearNative native_clear = nullptr;
 AggregateEvent native_aggregate_event = nullptr;
 AggregateOperation native_aggregate_clear = nullptr;
 AggregateOperation native_aggregate_flush = nullptr;
+BufferEvent native_buffer_event = nullptr;
+GraphEvent native_graph_event = nullptr;
+GraphEvent native_event_match = nullptr;
+SelectLink native_select_link = nullptr;
 std::atomic<Native> original;
 std::atomic<Native> original_jump;
 std::atomic<u64> charge_property{0};
@@ -215,6 +222,10 @@ struct NativeCache {
     u32 clear_records = 0;
     std::array<u32, 4> aggregate_records{};
     u64 aggregate_request = 0;
+    std::array<u32, 4> handoff_records{};
+    std::array<u64, 512> identities{};
+    std::array<u32, 512> names{};
+    u32 identity_records = 0;
     std::array<HeldSample, 128> held{};
 };
 
@@ -334,6 +345,222 @@ private:
     u64 previous;
 };
 
+bool HandoffBudget(u32 kind) {
+    ResetNativeCache();
+    if (native_cache.aggregate_request == 0) {
+        return false;
+    }
+    constexpr std::array<u32, 4> limits{2048, 4096, 4096, 4096};
+    auto& count = native_cache.handoff_records[kind];
+    if (count >= limits[kind]) {
+        return false;
+    }
+    if (++count == limits[kind]) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {kind + 6, count});
+    }
+    return true;
+}
+
+void NameSite(u32 index) {
+    if (index == 0 || native_cache.names[index % native_cache.names.size()] == index) {
+        return;
+    }
+    const u64 table = Word(guest_base + 0x3984330);
+    u32 count = 0;
+    if (table == 0 || !Read(guest_base + 0x3984338, &count, sizeof(count)) || index >= count ||
+        count > 2000000) {
+        return;
+    }
+    const u64 entry = Word(table + static_cast<u64>(index) * 8);
+    u32 flags = 0;
+    if (!Read(entry, &flags, sizeof(flags))) {
+        return;
+    }
+    native_cache.names[index % native_cache.names.size()] = index;
+    const bool wide = (flags & 1) != 0;
+    for (u32 offset = 0; offset < 192; offset += 96) {
+        std::array<u64, 12> words{};
+        if (!Read(entry + 0x10 + offset, words.data(), sizeof(words))) {
+            break;
+        }
+        u32 length = 0;
+        const auto* bytes = reinterpret_cast<const u8*>(words.data());
+        while (length < sizeof(words) && (bytes[length] != 0 || (wide && bytes[length + 1] != 0))) {
+            length += wide ? 2 : 1;
+        }
+        PadTrace::Record("DMC_NAME", {index, wide, offset, length, static_cast<s64>(words[0]),
+                                      static_cast<s64>(words[1]), static_cast<s64>(words[2]),
+                                      static_cast<s64>(words[3]), static_cast<s64>(words[4]),
+                                      static_cast<s64>(words[5]), static_cast<s64>(words[6]),
+                                      static_cast<s64>(words[7]), static_cast<s64>(words[8]),
+                                      static_cast<s64>(words[9]), static_cast<s64>(words[10]),
+                                      static_cast<s64>(words[11])});
+        if (length < sizeof(words)) {
+            break;
+        }
+    }
+}
+
+void Identity(u64 request, u64 object) {
+    auto& slot = native_cache.identities[(object >> 4) % native_cache.identities.size()];
+    if (object == 0 || slot == object || native_cache.identity_records >= 1024) {
+        return;
+    }
+    std::array<u64, 11> words{};
+    if (!Read(object, words.data(), sizeof(words))) {
+        return;
+    }
+    slot = object;
+    ++native_cache.identity_records;
+    PadTrace::Record("DMC_OBJECT", {static_cast<s64>(request), static_cast<s64>(object),
+                                    static_cast<s64>(words[9]), static_cast<s64>(words[10]),
+                                    static_cast<s64>(words[8]), static_cast<s64>(words[0])});
+    NameSite(static_cast<u32>(words[9]));
+    if (words[10] != object) {
+        Identity(request, words[10]);
+    }
+}
+
+void BufferState(u64 request, u32 phase, u64 buffer) {
+    if (buffer == 0) {
+        return;
+    }
+    const u32 count = LiveDword(buffer + 8);
+    const u64 owner = LiveWord(buffer + 0x28);
+    const u64 items = LiveWord(buffer);
+    PadTrace::Record("DMC_BUFFER",
+                     {static_cast<s64>(request), phase, static_cast<s64>(buffer), count,
+                      LiveDword(buffer + 0x10), static_cast<s64>(owner), static_cast<s64>(items)});
+    Identity(request, owner);
+    for (u32 i = 0; items != 0 && i < count && i < 8; ++i) {
+        const u64 event = LiveWord(items + i * 8);
+        if (event == 0) {
+            continue;
+        }
+        PadTrace::Record("DMC_BUFFER_ITEM",
+                         {static_cast<s64>(request), phase, i, static_cast<s64>(event),
+                          static_cast<s64>(LiveWord(event + 0x60)), LiveDword(event + 0x68),
+                          LiveDword(event + 0x6c), static_cast<s64>(LiveWord(event + 0x50))});
+        Identity(request, LiveWord(event + 0x60));
+    }
+}
+
+void GraphState(u64 request, u32 phase, u64 graph) {
+    if (graph == 0) {
+        return;
+    }
+    const u64 node = LiveWord(graph + 0x88);
+    PadTrace::Record("DMC_GRAPH", {static_cast<s64>(request), phase, static_cast<s64>(graph),
+                                   static_cast<s64>(LiveWord(graph + 0x60)), static_cast<s64>(node),
+                                   LiveDword(graph + 0x90), node != 0 ? LiveDword(node + 0xd0) : 0,
+                                   node != 0 ? LiveDword(node + 0xb4) : 0,
+                                   static_cast<s64>(node != 0 ? LiveWord(node + 0x80) : 0),
+                                   static_cast<s64>(node != 0 ? LiveWord(node + 0x88) : 0)});
+    Identity(request, graph);
+    Identity(request, node);
+}
+
+u32 PS4_SYSV_ABI ObserveBufferEvent(void* buffer, void* owner, void* event, void* first,
+                                    void* second) {
+    if (!PadTrace::Enabled() || !HandoffBudget(0)) {
+        return native_buffer_event(buffer, owner, event, first, second);
+    }
+    const u64 request = PadTrace::NextId();
+    PadTrace::Record("DMC_BUFFER_CALL",
+                     {static_cast<s64>(request), static_cast<s64>(native_cache.aggregate_request),
+                      reinterpret_cast<s64>(buffer), reinterpret_cast<s64>(owner),
+                      reinterpret_cast<s64>(event), reinterpret_cast<s64>(first),
+                      reinterpret_cast<s64>(second),
+                      reinterpret_cast<s64>(__builtin_return_address(0))});
+    BufferState(request, 0, reinterpret_cast<u64>(buffer));
+    Identity(request, reinterpret_cast<u64>(owner));
+    u32 result = 0;
+    {
+        const AggregateScope scope{request};
+        result = native_buffer_event(buffer, owner, event, first, second);
+    }
+    BufferState(request, 1, reinterpret_cast<u64>(buffer));
+    PadTrace::Record("DMC_HANDOFF_END", {static_cast<s64>(request), 0, result});
+    return result;
+}
+
+u32 PS4_SYSV_ABI ObserveGraphEvent(void* graph, void* event) {
+    if (!PadTrace::Enabled() || !HandoffBudget(1)) {
+        return native_graph_event(graph, event);
+    }
+    const u64 request = PadTrace::NextId();
+    PadTrace::Record("DMC_GRAPH_CALL",
+                     {static_cast<s64>(request), static_cast<s64>(native_cache.aggregate_request),
+                      reinterpret_cast<s64>(graph), reinterpret_cast<s64>(event),
+                      reinterpret_cast<s64>(__builtin_return_address(0))});
+    GraphState(request, 0, reinterpret_cast<u64>(graph));
+    u32 result = 0;
+    {
+        const AggregateScope scope{request};
+        result = native_graph_event(graph, event);
+    }
+    GraphState(request, 1, reinterpret_cast<u64>(graph));
+    PadTrace::Record("DMC_HANDOFF_END", {static_cast<s64>(request), 1, result});
+    return result;
+}
+
+u32 PS4_SYSV_ABI ObserveEventMatch(void* rule, void* event) {
+    if (!PadTrace::Enabled() || !HandoffBudget(2)) {
+        return native_event_match(rule, event);
+    }
+    const u64 request = PadTrace::NextId();
+    const u64 address = reinterpret_cast<u64>(rule);
+    PadTrace::Record("DMC_MATCH_CALL",
+                     {static_cast<s64>(request), static_cast<s64>(native_cache.aggregate_request),
+                      static_cast<s64>(address), reinterpret_cast<s64>(event),
+                      static_cast<s64>(LiveWord(address + 0x68)), LiveDword(address + 0x78),
+                      reinterpret_cast<s64>(__builtin_return_address(0))});
+    Identity(request, address);
+    Identity(request, LiveWord(address + 0x68));
+    const u64 conditions = LiveWord(address + 0x70);
+    const u32 count = LiveDword(address + 0x78);
+    for (u32 i = 0; conditions != 0 && i < count && i < 8; ++i) {
+        const u64 condition = LiveWord(conditions + i * 8);
+        Identity(request, condition);
+        const u64 target = condition != 0 ? Word(Word(condition) + 0x248) : 0;
+        const u32 size = target == guest_base + 0xb73310   ? 32
+                         : target == guest_base + 0xa232a0 ? 8
+                                                           : 0;
+        std::array<u64, 4> fields{};
+        if (size != 0 && Read(condition + 0x60, fields.data(), size)) {
+            PadTrace::Record("DMC_CONDITION_FIELDS",
+                             {static_cast<s64>(request), static_cast<s64>(condition), i,
+                              static_cast<s64>(target), size, static_cast<s64>(fields[0]),
+                              static_cast<s64>(fields[1]), static_cast<s64>(fields[2]),
+                              static_cast<s64>(fields[3])});
+        }
+    }
+    const AggregateScope scope{request};
+    const u32 result = native_event_match(rule, event);
+    PadTrace::Record("DMC_HANDOFF_END", {static_cast<s64>(request), 2, result});
+    return result;
+}
+
+void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
+    if (!PadTrace::Enabled() || !HandoffBudget(3)) {
+        return native_select_link(set, event);
+    }
+    const u64 request = PadTrace::NextId();
+    const u64 address = reinterpret_cast<u64>(set);
+    PadTrace::Record("DMC_SELECT_CALL",
+                     {static_cast<s64>(request), static_cast<s64>(native_cache.aggregate_request),
+                      static_cast<s64>(address), reinterpret_cast<s64>(event),
+                      LiveDword(address + 0x68), LiveDword(address + 0x80),
+                      reinterpret_cast<s64>(__builtin_return_address(0))});
+    Identity(request, address);
+    const AggregateScope scope{request};
+    void* link = native_select_link(set, event);
+    Identity(request, reinterpret_cast<u64>(link));
+    PadTrace::Record("DMC_HANDOFF_END",
+                     {static_cast<s64>(request), 3, reinterpret_cast<s64>(link)});
+    return link;
+}
+
 void AggregateContext(u64 request, void* event) {
     if (event == nullptr || guest_base == 0) {
         return;
@@ -372,12 +599,14 @@ u32 PS4_SYSV_ABI ObserveAggregateEvent(void* object, void* event, u32 input) {
     const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
     AggregateState("DMC_AGG_EVENT_BEGIN", request, object, event, input, caller);
     AggregateContext(request, event);
+    BufferState(request, 0, reinterpret_cast<u64>(object) + 0x78);
     u32 result = 0;
     {
         const AggregateScope scope{request};
         result = native_aggregate_event(object, event, input);
     }
     AggregateState("DMC_AGG_EVENT_END", request, object, event, input, caller, result);
+    BufferState(request, 1, reinterpret_cast<u64>(object) + 0x78);
     return result;
 }
 
@@ -661,11 +890,26 @@ void InstallNative() {
         base + 0xa1f5d0, reinterpret_cast<u64>(&ObserveAggregateClear), aggregate_clear_bytes));
     native_aggregate_flush = reinterpret_cast<AggregateOperation>(
         NativeEntry(base + 0xa1f220, reinterpret_cast<u64>(&ObserveAggregateFlush), flush_bytes));
+    auto graph_bytes = event_bytes;
+    graph_bytes.back() = 0x38;
+    constexpr std::array<u8, 17> match_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                             0x54, 0x53, 0x49, 0x89, 0xf7, 0x49, 0x89, 0xfc};
+    native_buffer_event = reinterpret_cast<BufferEvent>(
+        NativeEntry(base + 0xa1c3c0, reinterpret_cast<u64>(&ObserveBufferEvent), event_bytes));
+    native_graph_event = reinterpret_cast<GraphEvent>(
+        NativeEntry(base + 0xa1fe10, reinterpret_cast<u64>(&ObserveGraphEvent), graph_bytes));
+    native_event_match = reinterpret_cast<GraphEvent>(
+        NativeEntry(base + 0xa26420, reinterpret_cast<u64>(&ObserveEventMatch), match_bytes));
+    native_select_link = reinterpret_cast<SelectLink>(
+        NativeEntry(base + 0xa20850, reinterpret_cast<u64>(&ObserveSelectLink), graph_bytes));
     LOG_INFO(Input, "[DMC TRACE] Native probes before guest execution: held={}, node_clear={}",
              native_held != nullptr, native_clear != nullptr);
     LOG_INFO(Input, "[DMC TRACE] Aggregator probes: event={}, clear={}, flush={}",
              native_aggregate_event != nullptr, native_aggregate_clear != nullptr,
              native_aggregate_flush != nullptr);
+    LOG_INFO(Input, "[DMC TRACE] Handoff probes: buffer={}, graph={}, match={}, select={}",
+             native_buffer_event != nullptr, native_graph_event != nullptr,
+             native_event_match != nullptr, native_select_link != nullptr);
 }
 
 void Install() {
@@ -674,6 +918,9 @@ void Install() {
     PadTrace::Record("DMC_AGG_HOOK",
                      {native_aggregate_event != nullptr, native_aggregate_clear != nullptr,
                       native_aggregate_flush != nullptr});
+    PadTrace::Record("DMC_HANDOFF_HOOK",
+                     {native_buffer_event != nullptr, native_graph_event != nullptr,
+                      native_event_match != nullptr, native_select_link != nullptr});
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;
