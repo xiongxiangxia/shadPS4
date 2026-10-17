@@ -123,7 +123,8 @@ def summarize(path):
                         "operand_before": hex(p[4]), "operand_after": hex(p[5]),
                         "changed_outcome": bool(p[6]), "first_observation": bool(p[7]),
                     })
-            elif kind in ("DMC_PROBE_LIMIT", "DMC_BRANCH_LIMIT"):
+            elif kind in ("DMC_PROBE_LIMIT", "DMC_BRANCH_LIMIT", "DMC_WATCH_LIMIT",
+                          "DMC_NATIVE_LIMIT"):
                 dmc_probe_limits.append({"monotonic_us": timestamp, "kind": kind,
                                          "thread": row["thread"], "p0": p[0], "p1": p[1]})
             elif kind == "DMC_LET_END":

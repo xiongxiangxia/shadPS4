@@ -2,6 +2,47 @@
 
 ## DmC script assignment observer (experimental, Windows only)
 
+### Native held-input and buffer-clear probes
+
+The native extension installs two version-specific entry detours after loading eboot and before
+Linker::Execute starts guest execution. It does not install entry detours while F9 recording is
+running. Serial, app version, native registration strings and all displaced entry bytes are
+checked; mismatches leave the affected entry unchanged.
+Copied instruction sequences have complete instruction boundaries and no relative operands:
+IsHeld at eboot+0x91d750 (14 bytes), Node.ClearBufferedInput at eboot+0xa21c90 (17 bytes).
+Each delegates to an executable trampoline containing the original instructions, followed by an
+absolute jump back. Trampoline memory stays allocated for process lifetime. Game files are unchanged.
+This still changes in-process execution and introduces overhead; runtime validation is required.
+Set `SHADPS4_DMC_NATIVE=0` before launching to skip both native detours. Baseline builds omit them.
+
+The registered UNTInputexecIsHeld wrapper calls 0x91d750; that function tests object+0x220.
+UNTInputexecGetHeldTime calls 0x91d7a0, which uses timestamps at object+0x228+button*4.
+UNTActionGraph_NodeexecClearBufferedInput calls 0xa21c90. Registration-string relocations and
+wrapper disassembly associate these names with the entrypoints; names alone are not the evidence.
+Native IsHeld calls can be inlined or bypassed. An absent event does not mean the game saw release.
+Other buffer-clearing paths, including direct aggregator calls, are NOT yet hooked.
+
+`DMC_NATIVE_HOOK`: held-entry installed flag, node-clear-entry installed flag, emitted at F9 start.
+Startup also logs each installation result to shad_log.txt, even when recording is initially off.
+`DMC_NATIVE_HELD`: input object, queried button index, original function result, held bitmask,
+held-since float bits (only for button<32), native caller return address, slot call count.
+Snapshots are recorded on a changed mask/result/timestamp or at most once per 100 ms for unchanged
+object/button/caller slots. There are 128 direct-mapped slots and 4096 events per thread/capture;
+slot collisions may cause extra snapshots. The timestamp is not a measured charge duration and
+button indices must be associated with input events before calling one the gun button.
+
+`DMC_NATIVE_CLEAR_BEGIN`: request, node, event argument, owner-graph pointer (node+0x70),
+node state (node+0xd0), raw flags word (node+0xb4), native caller return address.
+`DMC_NATIVE_CLEAR_END`: request, original return value, resulting node state, raw flags word.
+These offsets are observed in the native implementation. Raw state/flag meanings and the event
+layout remain provisional. Read-back assumes the live input/node object remains valid through
+the call; no deep pointer traversal is performed. Events may be nested. A clear call is not by
+itself proof of an incorrect cancellation or identification of the charged weapon's request.
+Node-clear event pairs are capped at 1024 per thread/capture. `DMC_NATIVE_LIMIT` reports kind
+(0 held, 1 clear) and limit. F9 capture starts reset the per-thread budgets.
+
+### Script probes
+
 This extension replaces selected interpreter dispatch pointers in process memory, leaving
 the original game files intact. It delegates to the original interpreter handlers and does
 not change field values or action decisions. It is installed when F9 starts recording, only

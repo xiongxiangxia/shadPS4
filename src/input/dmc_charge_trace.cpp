@@ -6,6 +6,8 @@
 #if defined(ENABLE_PADTRACE) && defined(_WIN64)
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <windows.h>
@@ -18,6 +20,10 @@
 namespace Input::DmcChargeTrace {
 namespace {
 using Native = void(PS4_SYSV_ABI*)(void*, void*, void*);
+using HeldNative = u32(PS4_SYSV_ABI*)(void*, u32);
+using ClearNative = u32(PS4_SYSV_ABI*)(void*, void*);
+HeldNative native_held = nullptr;
+ClearNative native_clear = nullptr;
 std::atomic<Native> original;
 std::atomic<Native> original_jump;
 std::atomic<u64> charge_property{0};
@@ -181,6 +187,151 @@ u64 Operand(void* frame) {
     return code;
 }
 
+u32 LiveDword(u64 address) {
+    u32 value = 0;
+    std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
+    return value;
+}
+
+struct HeldSample {
+    u64 object = 0;
+    u64 caller = 0;
+    u32 button = 0;
+    u32 mask = 0;
+    u32 result = 0;
+    u32 since = 0;
+    u64 calls = 0;
+    std::chrono::steady_clock::time_point recorded{};
+};
+
+struct NativeCache {
+    u64 generation = 0;
+    u32 held_records = 0;
+    u32 clear_records = 0;
+    std::array<HeldSample, 128> held{};
+};
+
+thread_local NativeCache native_cache;
+
+void ResetNativeCache() {
+    const u64 generation = capture_generation.load(std::memory_order_relaxed);
+    if (native_cache.generation != generation) {
+        native_cache = {};
+        native_cache.generation = generation;
+    }
+}
+
+u32 PS4_SYSV_ABI ObserveHeld(void* object, u32 button) {
+    const u32 result = native_held(object, button);
+    if (!PadTrace::Enabled()) {
+        return result;
+    }
+    ResetNativeCache();
+    if (native_cache.held_records >= 4096) {
+        return result;
+    }
+    const u64 address = reinterpret_cast<u64>(object);
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    const u32 mask = LiveDword(address + 0x220);
+    const u32 since = button < 32 ? LiveDword(address + 0x228 + button * 4) : 0;
+    auto& sample =
+        native_cache.held[((address >> 4) ^ (caller >> 4) ^ button) % native_cache.held.size()];
+    const bool first = sample.calls == 0 || sample.object != address || sample.caller != caller ||
+                       sample.button != button;
+    if (first) {
+        sample = {};
+        sample.object = address;
+        sample.caller = caller;
+        sample.button = button;
+    }
+    ++sample.calls;
+    const auto now = std::chrono::steady_clock::now();
+    if (first || sample.mask != mask || sample.result != result || sample.since != since ||
+        now - sample.recorded >= std::chrono::milliseconds{100}) {
+        ++native_cache.held_records;
+        PadTrace::Record("DMC_NATIVE_HELD",
+                         {static_cast<s64>(address), button, result, mask, since,
+                          static_cast<s64>(caller), static_cast<s64>(sample.calls)});
+        sample.mask = mask;
+        sample.result = result;
+        sample.since = since;
+        sample.recorded = now;
+        if (native_cache.held_records == 4096) {
+            PadTrace::Record("DMC_NATIVE_LIMIT", {0, 4096});
+        }
+    }
+    return result;
+}
+
+u32 PS4_SYSV_ABI ObserveClear(void* object, void* event) {
+    if (!PadTrace::Enabled()) {
+        return native_clear(object, event);
+    }
+    ResetNativeCache();
+    if (native_cache.clear_records >= 1024) {
+        return native_clear(object, event);
+    }
+    ++native_cache.clear_records;
+    const u64 request = PadTrace::NextId();
+    const u64 address = reinterpret_cast<u64>(object);
+    PadTrace::Record("DMC_NATIVE_CLEAR_BEGIN",
+                     {static_cast<s64>(request), static_cast<s64>(address),
+                      reinterpret_cast<s64>(event), static_cast<s64>(LiveWord(address + 0x70)),
+                      LiveDword(address + 0xd0), LiveDword(address + 0xb4),
+                      reinterpret_cast<s64>(__builtin_return_address(0))});
+    const u32 result = native_clear(object, event);
+    PadTrace::Record(
+        "DMC_NATIVE_CLEAR_END",
+        {static_cast<s64>(request), result, LiveDword(address + 0xd0), LiveDword(address + 0xb4)});
+    if (native_cache.clear_records == 1024) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {1, 1024});
+    }
+    return result;
+}
+
+void AbsoluteJump(u8* output, u64 target) {
+    constexpr std::array<u8, 6> instruction{0xff, 0x25, 0, 0, 0, 0};
+    std::memcpy(output, instruction.data(), instruction.size());
+    std::memcpy(output + instruction.size(), &target, sizeof(target));
+}
+
+template <std::size_t Size>
+void* NativeEntry(u64 address, u64 observer, const std::array<u8, Size>& expected) {
+    static_assert(Size >= 14);
+    std::array<u8, Size> bytes{};
+    if (!Read(address, bytes.data(), bytes.size()) || bytes != expected) {
+        return nullptr;
+    }
+    auto* trampoline = static_cast<u8*>(
+        VirtualAlloc(nullptr, Size + 14, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (trampoline == nullptr) {
+        return nullptr;
+    }
+    std::memcpy(trampoline, bytes.data(), Size);
+    AbsoluteJump(trampoline + Size, address + Size);
+    DWORD previous = 0;
+    if (!VirtualProtect(trampoline, Size + 14, PAGE_EXECUTE_READ, &previous)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    FlushInstructionCache(GetCurrentProcess(), trampoline, Size + 14);
+    if (!VirtualProtect(reinterpret_cast<void*>(address), Size, PAGE_EXECUTE_READWRITE,
+                        &previous)) {
+        VirtualFree(trampoline, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    std::array<u8, Size> patch{};
+    patch.fill(0x90);
+    AbsoluteJump(patch.data(), observer);
+    std::memcpy(reinterpret_cast<void*>(address), patch.data(), patch.size());
+    DWORD unused = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(address), Size, previous, &unused)) {
+        LOG_WARNING(Input, "[DMC TRACE] Native probe page protection could not be restored");
+    }
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), Size);
+    return trampoline;
+}
+
 void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     const auto handler = original.load(std::memory_order_acquire);
     if (!PadTrace::Enabled()) {
@@ -341,8 +492,46 @@ void PS4_SYSV_ABI ObserveJump(void* object, void* frame, void* result) {
 }
 } // namespace
 
+void InstallNative() {
+    if (native_held != nullptr || native_clear != nullptr ||
+        Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
+        Common::ElfInfo::Instance().AppVer() != "01.03") {
+        return;
+    }
+    const char* setting = std::getenv("SHADPS4_DMC_NATIVE");
+    if (setting != nullptr && std::strcmp(setting, "0") == 0) {
+        return;
+    }
+    const u64 base = MemoryPatcher::g_eboot_address;
+    if (base == 0) {
+        return;
+    }
+    constexpr char held_name[] = "UNTInputexecIsHeld";
+    constexpr char clear_name[] = "UNTActionGraph_NodeexecClearBufferedInput";
+    std::array<char, sizeof(held_name)> held_registration{};
+    std::array<char, sizeof(clear_name)> clear_registration{};
+    if (!Read(base + 0x25cbbd9, held_registration.data(), held_registration.size()) ||
+        !Read(base + 0x25c065c, clear_registration.data(), clear_registration.size()) ||
+        std::memcmp(held_registration.data(), held_name, sizeof(held_name)) != 0 ||
+        std::memcmp(clear_registration.data(), clear_name, sizeof(clear_name)) != 0) {
+        LOG_WARNING(Input, "[DMC TRACE] Native registrations differ; entry probes skipped");
+        return;
+    }
+    constexpr std::array<u8, 14> held_bytes{0x8b, 0x87, 0x20, 0x02, 0x00, 0x00, 0x0f,
+                                            0xa3, 0xf0, 0x19, 0xc0, 0x83, 0xe0, 0x01};
+    constexpr std::array<u8, 17> clear_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53, 0x49, 0x89,
+                                             0xf6, 0x48, 0x89, 0xfb, 0x48, 0x8b, 0x43, 0x70};
+    native_held = reinterpret_cast<HeldNative>(
+        NativeEntry(base + 0x91d750, reinterpret_cast<u64>(&ObserveHeld), held_bytes));
+    native_clear = reinterpret_cast<ClearNative>(
+        NativeEntry(base + 0xa21c90, reinterpret_cast<u64>(&ObserveClear), clear_bytes));
+    LOG_INFO(Input, "[DMC TRACE] Native probes before guest execution: held={}, node_clear={}",
+             native_held != nullptr, native_clear != nullptr);
+}
+
 void Install() {
     capture_generation.fetch_add(1, std::memory_order_relaxed);
+    PadTrace::Record("DMC_NATIVE_HOOK", {native_held != nullptr, native_clear != nullptr});
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;
@@ -397,6 +586,7 @@ void Install() {
 } // namespace Input::DmcChargeTrace
 #else
 namespace Input::DmcChargeTrace {
+void InstallNative() {}
 void Install() {}
 } // namespace Input::DmcChargeTrace
 #endif

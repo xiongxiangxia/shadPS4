@@ -4,5 +4,6 @@
 #pragma once
 
 namespace Input::DmcChargeTrace {
+void InstallNative();
 void Install();
-}
+} // namespace Input::DmcChargeTrace
