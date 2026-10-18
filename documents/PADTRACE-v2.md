@@ -78,13 +78,33 @@ remain diagnostic and timing-sensitive. No buffering, animation, or emulation re
 
 ### Correlated action/buffer handoff probes
 
+Current sparse mode removes the matcher and selector detours entirely. DMC_HANDOFF_HOOK's last
+two flags are intentionally zero; DMC_HANDOFF_SPARSE reports version 1, buffer-record limit 256,
+graph-record limit 512, and identity-attempt limit 96. The detailed matcher/selector schemas
+below describe older captures only. No candidate-condition traversal runs in current builds.
+
+Buffer helpers copy a fixed-size snapshot (at most eight items) before and after the original
+call, then emit records only if it changed. Aggregator entry/exit buffer detail is likewise
+change-only. Graph hooks retain first/new observations, successful handling and state changes;
+unchanged repeated rejections are suppressed through a 128-entry append-only cache. Once full,
+new unchanged rejections are omitted rather than repeatedly replacing existing entries.
+The hard emitted-record limits still apply. Unchanged repeated visits do not
+spend these limits or perform identity/name lookup, guarded-memory queries or CSV writes.
+
+Handoff CALL/END and buffer/graph snapshots are now emitted AFTER the original call, using saved
+scalar snapshots for the before state. Their timestamps do not measure game-function duration
+or exact branch execution time. Parent IDs still link each record to its enclosing aggregator
+request, but buffer/graph helpers no longer establish additional nested parent scopes. Original
+event metadata is captured by DMC_AGG_CONTEXT before dispatch. No pooled event is dereferenced
+after it has left a live pending buffer solely to reconstruct a before snapshot.
+
 Static inspection of DevilGame.xxx identifies DVPlayerController_Player.PlayerTick assigning
 m_ConsumedHeldInput_RangedAttack from SendActionGraphEvent(RangedAttack, Held), gated by
 m_OnlyConsumeHeldInputsOnce. An acknowledged buffered event can therefore stop further Held
 submissions without proving that a charge action has started. This is game logic, not evidence
 that the emulator's handling differs from hardware. Do not change the consumption flag blindly.
 
-Additional entry detours at 0xa1c3c0 (buffer event), 0xa1fe10 (graph event), 0xa26420 (event
+The original detailed implementation used entry detours at 0xa1c3c0 (buffer event), 0xa1fe10 (graph event), 0xa26420 (event
 descriptor/conditions match), and 0xa20850 (link selection) preserve all arguments and results.
 They record only while nested under an observed aggregator call, clear, or flush. All displaced
 17-byte prefixes are complete instructions without relative operands. The buffer owner argument
@@ -117,9 +137,10 @@ predicate address, copied byte count, four raw words starting at +0x60. Only pre
 native targets match 0xb73310 (DV common, 32 bytes) or 0xa232a0 (NT common, 8 bytes) are copied;
 other conditions are identified but not evaluated or interpreted by the logger.
 
-`DMC_OBJECT`: request, object, packed FName, class, outer, vtable. Identities are cached in 512
-direct-mapped slots, capped at 1024 records per thread/capture. Object reuse or slot collisions
-may make the dictionary incomplete. `DMC_NAME`: FName index, wide flag, byte offset, valid byte
+`DMC_OBJECT`: request, object, packed FName, class, outer, vtable. Current identity caching uses
+96 append-only slots per thread/capture, including failed reads; duplicate attempts do not
+repeat guarded reads. This intentionally limits dictionary coverage. Name lookup failures are
+also cached to avoid repeatedly querying an unavailable table. `DMC_NAME`: FName index, wide flag, byte offset, valid byte
 count, twelve little-endian 64-bit chunks. Decode as UTF-16LE if wide, otherwise the game's
 8-bit name encoding; at most 192 bytes are copied per name. FName number is retained in the
 upper 32 bits of DMC_OBJECT's packed name, not appended to dictionary strings. The name table

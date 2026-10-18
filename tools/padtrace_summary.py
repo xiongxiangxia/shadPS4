@@ -62,6 +62,7 @@ def summarize(path):
     graph_states = []
     objects = {}
     name_chunks = collections.defaultdict(dict)
+    handoff_sparse = False
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -125,6 +126,8 @@ def summarize(path):
                 wait_timeouts += p[2] == 0
             elif kind == "READ_STATE":
                 read_callers[hex(p[2])] += 1
+            elif kind == "DMC_HANDOFF_SPARSE":
+                handoff_sparse = bool(p[0])
             elif kind == "DMC_NAME":
                 raw = b"".join((v & ((1 << 64) - 1)).to_bytes(8, "little") for v in p[4:16])
                 name_chunks[(p[0], bool(p[1]))][p[2]] = raw[:max(0, min(p[3], 96))]
@@ -277,6 +280,9 @@ def summarize(path):
         "dmc_aggregate_calls_first_100": aggregate_calls,
         "dmc_aggregate_contexts_first_100": aggregate_contexts,
         "dmc_objects": objects,
+        "dmc_handoff_sparse": handoff_sparse,
+        "dmc_handoff_duration_note": "Sparse CALL/END timestamps cover emission, not game execution"
+        if handoff_sparse else "Detailed CALL/END timestamps include instrumentation overhead",
         "dmc_handoffs_first_2000": handoffs,
         "dmc_buffers_first_2000": buffer_states,
         "dmc_buffer_items_first_2000": buffer_items,
