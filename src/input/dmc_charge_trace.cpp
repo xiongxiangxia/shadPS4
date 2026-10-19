@@ -26,6 +26,7 @@ using AggregateEvent = u32(PS4_SYSV_ABI*)(void*, void*, u32);
 using AggregateOperation = void(PS4_SYSV_ABI*)(void*);
 using BufferEvent = u32(PS4_SYSV_ABI*)(void*, void*, void*, void*, void*);
 using GraphEvent = u32(PS4_SYSV_ABI*)(void*, void*);
+using OwnerSwitch = void(PS4_SYSV_ABI*)(void*, void*);
 HeldNative native_held = nullptr;
 ClearNative native_clear = nullptr;
 AggregateEvent native_aggregate_event = nullptr;
@@ -33,6 +34,8 @@ AggregateOperation native_aggregate_clear = nullptr;
 AggregateOperation native_aggregate_flush = nullptr;
 BufferEvent native_buffer_event = nullptr;
 GraphEvent native_graph_event = nullptr;
+OwnerSwitch native_active_switch = nullptr;
+OwnerSwitch native_buffer_switch = nullptr;
 std::atomic<Native> original;
 std::atomic<Native> original_jump;
 std::atomic<u64> charge_property{0};
@@ -264,6 +267,7 @@ struct NativeCache {
     std::array<u64, 96> identities{};
     std::array<u32, 512> names{};
     u32 identity_records = 0;
+    u32 owner_records = 0;
     std::array<GraphSample, 128> graphs{};
     std::array<HeldSample, 128> held{};
 };
@@ -276,6 +280,21 @@ void ResetNativeCache() {
         native_cache = {};
         native_cache.generation = generation;
     }
+}
+
+void GameClock(u64 request, u64 input = 0, u32 button = 0) {
+    const u64 engine = Word(guest_base + 0x3a548e8);
+    const u64 contexts = engine != 0 ? Word(engine + 0x80) : 0;
+    const u64 current = contexts != 0 ? Word(contexts + 0x60) : 0;
+    const u64 world = current != 0 ? Word(current) : 0;
+    std::array<u32, 4> times{};
+    const bool readable = world != 0 && Read(world + 0x690, times.data(), sizeof(times));
+    PadTrace::Record("DMC_GAME_CLOCK",
+                     {static_cast<s64>(request), static_cast<s64>(world), readable, times[0],
+                      times[1], times[2], times[3], static_cast<s64>(Word(guest_base + 0x3940be0)),
+                      static_cast<s64>(Word(guest_base + 0x3f58870)), static_cast<s64>(input),
+                      button, input != 0 ? LiveDword(input + 0x220) : 0,
+                      input != 0 && button < 32 ? LiveDword(input + 0x228 + button * 4) : 0});
 }
 
 u32 PS4_SYSV_ABI ObserveHeld(void* object, u32 button) {
@@ -309,6 +328,9 @@ u32 PS4_SYSV_ABI ObserveHeld(void* object, u32 button) {
         PadTrace::Record("DMC_NATIVE_HELD",
                          {static_cast<s64>(address), button, result, mask, since,
                           static_cast<s64>(caller), static_cast<s64>(sample.calls)});
+        if (button == 6) {
+            GameClock(0, address, button);
+        }
         sample.mask = mask;
         sample.result = result;
         sample.since = since;
@@ -595,6 +617,77 @@ u32 PS4_SYSV_ABI ObserveGraphEvent(void* graph, void* event) {
     GraphState(request, 1, after);
     PadTrace::Record("DMC_HANDOFF_END", {static_cast<s64>(request), 1, result});
     return result;
+}
+
+void OwnerStack(u64 request, u64 frame) {
+    std::array<u64, 6> callers{};
+    u32 count = 0;
+    for (; count < callers.size() && frame != 0; ++count) {
+        std::array<u64, 2> words{};
+        if (!Read(frame, words.data(), sizeof(words)) || words[1] < guest_base ||
+            words[1] >= guest_base + 0x2f7b360) {
+            break;
+        }
+        callers[count] = words[1];
+        if (words[0] <= frame) {
+            ++count;
+            break;
+        }
+        frame = words[0];
+    }
+    PadTrace::Record("DMC_OWNER_STACK",
+                     {static_cast<s64>(request), count, static_cast<s64>(callers[0]),
+                      static_cast<s64>(callers[1]), static_cast<s64>(callers[2]),
+                      static_cast<s64>(callers[3]), static_cast<s64>(callers[4]),
+                      static_cast<s64>(callers[5])});
+}
+
+void ObserveOwnerSwitch(void* object, void* incoming, u32 kind, u64 caller, u64 frame) {
+    const auto handler = kind == 0 ? native_active_switch : native_buffer_switch;
+    if (!PadTrace::Enabled()) {
+        return handler(object, incoming);
+    }
+    ResetNativeCache();
+    const u64 address = reinterpret_cast<u64>(object);
+    if (native_cache.owner_records >= 64 || LiveDword(address + 0x80) == 0) {
+        return handler(object, incoming);
+    }
+    const auto before = SnapshotBuffer(address + 0x78);
+    const u64 active = LiveWord(address + 0x70);
+    const u32 internal = LiveDword(address + 0xd8);
+    handler(object, incoming);
+    const auto after = SnapshotBuffer(address + 0x78);
+    if (before == after) {
+        return;
+    }
+    ++native_cache.owner_records;
+    const u64 request = PadTrace::NextId();
+    PadTrace::Record("DMC_OWNER_SWITCH",
+                     {static_cast<s64>(request), kind, static_cast<s64>(address),
+                      reinterpret_cast<s64>(incoming), static_cast<s64>(caller),
+                      static_cast<s64>(native_cache.aggregate_request), static_cast<s64>(active),
+                      static_cast<s64>(LiveWord(address + 0x70)), internal,
+                      LiveDword(address + 0xd8), LiveDword(address + 0xb0)});
+    BufferState(request, 0, before);
+    BufferState(request, 1, after);
+    Identity(request, reinterpret_cast<u64>(incoming));
+    OwnerStack(request, frame);
+    GameClock(request);
+    if (native_cache.owner_records == 64) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {10, 64});
+    }
+}
+
+void PS4_SYSV_ABI ObserveActiveSwitch(void* object, void* incoming) {
+    const u64 frame = LiveWord(reinterpret_cast<u64>(__builtin_frame_address(0)));
+    ObserveOwnerSwitch(object, incoming, 0, reinterpret_cast<u64>(__builtin_return_address(0)),
+                       frame);
+}
+
+void PS4_SYSV_ABI ObserveBufferSwitch(void* object, void* incoming) {
+    const u64 frame = LiveWord(reinterpret_cast<u64>(__builtin_frame_address(0)));
+    ObserveOwnerSwitch(object, incoming, 1, reinterpret_cast<u64>(__builtin_return_address(0)),
+                       frame);
 }
 
 u32 AggregateContext(u64 request, void* event) {
@@ -937,6 +1030,15 @@ void InstallNative() {
         NativeEntry(base + 0xa1c3c0, reinterpret_cast<u64>(&ObserveBufferEvent), event_bytes));
     native_graph_event = reinterpret_cast<GraphEvent>(
         NativeEntry(base + 0xa1fe10, reinterpret_cast<u64>(&ObserveGraphEvent), graph_bytes));
+    constexpr std::array<u8, 14> active_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                              0x56, 0x41, 0x54, 0x53, 0x49, 0x89, 0xf6};
+    constexpr std::array<u8, 17> buffer_switch_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56,
+                                                     0x53, 0x49, 0x89, 0xfe, 0x41, 0x8b,
+                                                     0x86, 0x80, 0x00, 0x00, 0x00};
+    native_active_switch = reinterpret_cast<OwnerSwitch>(
+        NativeEntry(base + 0xa1e2c0, reinterpret_cast<u64>(&ObserveActiveSwitch), active_bytes));
+    native_buffer_switch = reinterpret_cast<OwnerSwitch>(NativeEntry(
+        base + 0xa1e510, reinterpret_cast<u64>(&ObserveBufferSwitch), buffer_switch_bytes));
     LOG_INFO(Input, "[DMC TRACE] Native probes before guest execution: held={}, node_clear={}",
              native_held != nullptr, native_clear != nullptr);
     LOG_INFO(Input, "[DMC TRACE] Aggregator probes: event={}, clear={}, flush={}",
@@ -944,6 +1046,8 @@ void InstallNative() {
              native_aggregate_flush != nullptr);
     LOG_INFO(Input, "[DMC TRACE] Sparse handoff probes: buffer={}, graph={}; match/select disabled",
              native_buffer_event != nullptr, native_graph_event != nullptr);
+    LOG_INFO(Input, "[DMC TRACE] Pending ownership probes: active={}, buffer={}",
+             native_active_switch != nullptr, native_buffer_switch != nullptr);
 }
 
 void Install() {
@@ -955,6 +1059,8 @@ void Install() {
     PadTrace::Record("DMC_HANDOFF_HOOK",
                      {native_buffer_event != nullptr, native_graph_event != nullptr, 0, 0});
     PadTrace::Record("DMC_HANDOFF_SPARSE", {1, 256, 512, 96});
+    PadTrace::Record("DMC_OWNER_HOOK",
+                     {native_active_switch != nullptr, native_buffer_switch != nullptr});
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;

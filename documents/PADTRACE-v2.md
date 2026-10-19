@@ -78,6 +78,48 @@ remain diagnostic and timing-sensitive. No buffering, animation, or emulation re
 
 ### Correlated action/buffer handoff probes
 
+### Pending-owner transition and game-clock audit
+
+Two additional narrow detours observe native functions at eboot+0xa1e2c0 and +0xa1e510.
+Their displaced 14/17-byte prologues are complete, PC-independent instructions. The former
+switches aggregator+0x70 and can clear pending input when internal counter +0xd8 is zero and
+incoming owner differs from buffer owner +0xa0. The latter clears on an owner mismatch without
+that counter test. Both implement the clear inline rather than calling ClearBufferedInput.
+The labels are inferred from disassembly, not recovered debug symbols. No condition is changed.
+
+Only calls with a nonempty pending buffer AND a changed before/after snapshot emit records.
+At most 64 changed calls are recorded per thread/capture; DMC_NATIVE_LIMIT kind 10 reports
+exhaustion. Empty-buffer/unchanged calls do not perform name lookup, stack traversal, clock
+traversal or CSV writes. These probes also observe calls outside an aggregator-event scope,
+where parent request is zero. DMC_OWNER_HOOK reports the two installed flags.
+
+DMC_OWNER_SWITCH: request, path (0 a1e2c0, 1 a1e510), aggregator, incoming owner, direct caller,
+parent request, active pointer (+0x70) before/after, internal counter (+0xd8) before/after,
+raw flags (+0xb0) after. DMC_BUFFER/ITEM snapshots with the same request show what disappeared.
+DMC_OWNER_STACK: request, count, up to six frame-chain return addresses within the eboot code
+range. The direct caller is separate. Unwind is best effort; missing/optimized frames do not
+mean missing execution. Guarded reads run only for emitted owner changes.
+
+DMC_GAME_CLOCK: request (zero for a sampled held query), world pointer, readable flag,
+WorldInfo+0x690 float bits, raw words +0x694/+0x698/+0x69c, double bits at eboot+0x3940be0 and
++0x3f58870, input object, button index, held mask, held-since float bits. The world pointer is
+resolved by reproducing the non-interacting esi=0 path of 0x521ea0, starting with the global at
++0x3a548e8 and reading +0x80, +0x60, then the first pointer. No game function is invoked.
+0x91d7a0 uses WorldInfo+0x690 minus NTInput+0x228+button*4 to compute held time. The adjacent
+world fields remain uninterpreted; they are NOT claimed to be separate verified clocks.
+The two seconds-per-cycle globals are populated from sceKernelGetTscFrequency at 0xa5be and
+0x1bcfc04. This supplies game-side timing evidence rather than assuming that correct exported
+kernel clocks imply correct gameplay timing. Samples occur only alongside existing sampled
+NTInput button-6 held records and emitted owner changes. Each pointer hop is guarded.
+
+Static audit so far has not identified an emulation fault: the game queries the TSC frequency
+when constructing its time conversion factors, and NTJobCode.prx is loaded later despite early
+unresolved-import warnings. Neither observation proves all timing or job synchronization is
+correct. This build does not change kernel timing, scheduling, input consumption, weapon state,
+or game files, and does not implement an input retry workaround.
+
+### Sparse buffer and action handoff records
+
 Current sparse mode removes the matcher and selector detours entirely. DMC_HANDOFF_HOOK's last
 two flags are intentionally zero; DMC_HANDOFF_SPARSE reports version 1, buffer-record limit 256,
 graph-record limit 512, and identity-attempt limit 96. The detailed matcher/selector schemas

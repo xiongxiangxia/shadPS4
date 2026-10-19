@@ -6,6 +6,7 @@ import bisect
 import collections
 import csv
 import json
+import struct
 from pathlib import Path
 
 
@@ -63,6 +64,9 @@ def summarize(path):
     objects = {}
     name_chunks = collections.defaultdict(dict)
     handoff_sparse = False
+    owner_switches = []
+    owner_stacks = {}
+    game_clocks = []
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -128,6 +132,34 @@ def summarize(path):
                 read_callers[hex(p[2])] += 1
             elif kind == "DMC_HANDOFF_SPARSE":
                 handoff_sparse = bool(p[0])
+            elif kind == "DMC_OWNER_SWITCH" and len(owner_switches) < 64:
+                owner_switches.append({
+                    "monotonic_us": timestamp, "request": p[0], "path": p[1],
+                    "aggregator": hex(p[2]), "incoming_owner": hex(p[3]),
+                    "caller": hex(p[4]), "parent": p[5],
+                    "active_before_after": [hex(p[6]), hex(p[7])],
+                    "internal_counter_before_after": p[8:10], "flags_raw": p[10],
+                })
+            elif kind == "DMC_OWNER_STACK":
+                owner_stacks[p[0]] = [hex(v) for v in p[2:2 + min(max(p[1], 0), 6)]]
+            elif kind == "DMC_GAME_CLOCK" and len(game_clocks) < 200:
+                def float_bits(value):
+                    return struct.unpack("<f", (value & 0xffffffff).to_bytes(4, "little"))[0]
+                def double_bits(value):
+                    return struct.unpack("<d", (value & ((1 << 64) - 1)).to_bytes(8, "little"))[0]
+                world_time = float_bits(p[3]) if p[2] else None
+                since = float_bits(p[12]) if p[9] else None
+                held = p[9] != 0 and p[10] < 32 and bool(p[11] & (1 << p[10]))
+                game_clocks.append({
+                    "monotonic_us": timestamp, "request": p[0], "world": hex(p[1]),
+                    "readable": bool(p[2]), "world_time_s": world_time,
+                    "adjacent_time_words_raw": p[4:7],
+                    "seconds_per_cycle": [double_bits(p[7]), double_bits(p[8])],
+                    "input": hex(p[9]), "button": p[10], "held_mask": hex(p[11]),
+                    "held_since_s": since,
+                    "held_elapsed_s": world_time - since
+                    if held and world_time is not None and since is not None else None,
+                })
             elif kind == "DMC_NAME":
                 raw = b"".join((v & ((1 << 64) - 1)).to_bytes(8, "little") for v in p[4:16])
                 name_chunks[(p[0], bool(p[1]))][p[2]] = raw[:max(0, min(p[3], 96))]
@@ -281,6 +313,9 @@ def summarize(path):
         "dmc_aggregate_contexts_first_100": aggregate_contexts,
         "dmc_objects": objects,
         "dmc_handoff_sparse": handoff_sparse,
+        "dmc_owner_switches": owner_switches,
+        "dmc_owner_stacks": owner_stacks,
+        "dmc_game_clock_samples_first_200": game_clocks,
         "dmc_handoff_duration_note": "Sparse CALL/END timestamps cover emission, not game execution"
         if handoff_sparse else "Detailed CALL/END timestamps include instrumentation overhead",
         "dmc_handoffs_first_2000": handoffs,
