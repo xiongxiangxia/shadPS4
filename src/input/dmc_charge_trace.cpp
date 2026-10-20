@@ -27,6 +27,9 @@ using AggregateOperation = void(PS4_SYSV_ABI*)(void*);
 using BufferEvent = u32(PS4_SYSV_ABI*)(void*, void*, void*, void*, void*);
 using GraphEvent = u32(PS4_SYSV_ABI*)(void*, void*);
 using OwnerSwitch = void(PS4_SYSV_ABI*)(void*, void*);
+using SelectLink = void*(PS4_SYSV_ABI*)(void*, void*);
+using ConditionDispatch = void(PS4_SYSV_ABI*)(void*, void*, void*, void*);
+using NodeExit = void(PS4_SYSV_ABI*)(void*, void*, void*);
 HeldNative native_held = nullptr;
 ClearNative native_clear = nullptr;
 AggregateEvent native_aggregate_event = nullptr;
@@ -36,6 +39,10 @@ BufferEvent native_buffer_event = nullptr;
 GraphEvent native_graph_event = nullptr;
 OwnerSwitch native_active_switch = nullptr;
 OwnerSwitch native_buffer_switch = nullptr;
+SelectLink native_select_link = nullptr;
+GraphEvent native_match_event = nullptr;
+ConditionDispatch native_condition_dispatch = nullptr;
+NodeExit native_node_exit = nullptr;
 std::atomic<Native> original;
 std::atomic<Native> original_jump;
 std::atomic<u64> charge_property{0};
@@ -256,6 +263,47 @@ struct GraphSample {
     GraphSnapshot after{};
 };
 
+struct ConditionResult {
+    u64 object = 0;
+    u64 function = 0;
+    u64 context = 0;
+    u64 pawn = 0;
+    u64 caller = 0;
+    u32 result = 0;
+    bool operator==(const ConditionResult&) const = default;
+};
+
+struct MatchResult {
+    u64 definition = 0;
+    u32 result = 0;
+    bool operator==(const MatchResult&) const = default;
+};
+
+struct GateResults {
+    u32 condition_count = 0;
+    u32 match_count = 0;
+    u32 clipped = 0;
+    std::array<ConditionResult, 32> conditions{};
+    std::array<MatchResult, 32> matches{};
+    bool operator==(const GateResults&) const = default;
+};
+
+struct GateTrace {
+    u64 descriptor = 0;
+    GateResults results{};
+};
+
+struct GateSample {
+    u64 set = 0;
+    u64 descriptor = 0;
+    u64 selected = 0;
+    u32 type = 0;
+    u32 epoch = 0;
+    GateResults results{};
+};
+
+thread_local GateTrace* active_gate = nullptr;
+
 struct NativeCache {
     u64 generation = 0;
     u32 held_records = 0;
@@ -263,11 +311,19 @@ struct NativeCache {
     std::array<u32, 4> aggregate_records{};
     u64 aggregate_request = 0;
     u32 aggregate_type = 256;
+    u32 aggregate_held = 0;
     std::array<u32, 2> handoff_records{};
-    std::array<u64, 96> identities{};
+    std::array<u64, 256> identities{};
     std::array<u32, 512> names{};
     u32 identity_records = 0;
     u32 owner_records = 0;
+    u32 exit_records = 0;
+    u32 gate_records = 0;
+    u32 gun_since = 0;
+    u32 gun_epoch = 0;
+    u64 gun_descriptor = 0;
+    std::array<GateSample, 128> gates{};
+    std::array<std::array<u64, 2>, 64> topologies{};
     std::array<GraphSample, 128> graphs{};
     std::array<HeldSample, 128> held{};
 };
@@ -310,6 +366,10 @@ u32 PS4_SYSV_ABI ObserveHeld(void* object, u32 button) {
     const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
     const u32 mask = LiveDword(address + 0x220);
     const u32 since = button < 32 ? LiveDword(address + 0x228 + button * 4) : 0;
+    if (button == 6 && result != 0 && native_cache.gun_since != since) {
+        native_cache.gun_since = since;
+        ++native_cache.gun_epoch;
+    }
     auto& sample =
         native_cache.held[((address >> 4) ^ (caller >> 4) ^ button) % native_cache.held.size()];
     const bool first = sample.calls == 0 || sample.object != address || sample.caller != caller ||
@@ -395,19 +455,23 @@ void AggregateState(const char* kind, u64 request, void* object, void* event, u3
 
 class AggregateScope {
 public:
-    explicit AggregateScope(u64 request, u32 type = 256)
-        : previous{native_cache.aggregate_request}, previous_type{native_cache.aggregate_type} {
+    explicit AggregateScope(u64 request, u32 type = 256, u32 held = 0)
+        : previous{native_cache.aggregate_request}, previous_type{native_cache.aggregate_type},
+          previous_held{native_cache.aggregate_held} {
         native_cache.aggregate_request = request;
         native_cache.aggregate_type = type;
+        native_cache.aggregate_held = held;
     }
     ~AggregateScope() {
         native_cache.aggregate_request = previous;
         native_cache.aggregate_type = previous_type;
+        native_cache.aggregate_held = previous_held;
     }
 
 private:
     u64 previous;
     u32 previous_type;
+    u32 previous_held;
 };
 
 bool HandoffBudget(u32 kind) {
@@ -551,6 +615,256 @@ void GraphState(u64 request, u32 phase, const GraphSnapshot& snapshot) {
                       static_cast<s64>(snapshot.first_set), static_cast<s64>(snapshot.second_set)});
     Identity(request, snapshot.graph);
     Identity(request, snapshot.node);
+}
+
+void GateConditionDetails(u64 request, u64 condition) {
+    Identity(request, condition);
+    const u64 table = condition != 0 ? Word(condition) : 0;
+    if (table != 0) {
+        PadTrace::Record("DMC_GATE_DEFINITION",
+                         {static_cast<s64>(request), static_cast<s64>(condition),
+                          static_cast<s64>(Word(table + 0x248)),
+                          static_cast<s64>(Word(table + 0x250))});
+    }
+    if (table == 0 || Word(table + 0x250) != guest_base + 0xb72300) {
+        return;
+    }
+    const u64 token = Word(condition + 0x60);
+    u32 expected = 0;
+    u32 count = 0;
+    Read(condition + 0x68, &expected, sizeof(expected));
+    Read(condition + 0x78, &count, sizeof(count));
+    PadTrace::Record("DMC_GATE_TOKEN", {static_cast<s64>(request), static_cast<s64>(condition), 0,
+                                        static_cast<s64>(token), expected & 1, count});
+    NameSite(static_cast<u32>(token));
+    const u64 extra = Word(condition + 0x70);
+    for (u32 i = 0; extra != 0 && i < count && i < 8; ++i) {
+        std::array<u32, 3> item{};
+        if (!Read(extra + i * 12, item.data(), sizeof(item))) {
+            break;
+        }
+        const u64 name = item[0] | (static_cast<u64>(item[1]) << 32);
+        PadTrace::Record("DMC_GATE_TOKEN", {static_cast<s64>(request), static_cast<s64>(condition),
+                                            i + 1, static_cast<s64>(name), item[2] & 1, count});
+        NameSite(item[0]);
+    }
+}
+
+void GateRelations(u64 request, u64 set, u64 link, u32 kind, u64 container) {
+    if (container == 0) {
+        return;
+    }
+    const u64 array = Word(container + (kind == 1 ? 0x70 : 0x68));
+    u32 count = 0;
+    Read(container + (kind == 1 ? 0x78 : 0x70), &count, sizeof(count));
+    PadTrace::Record("DMC_GATE_RELATION_SET",
+                     {static_cast<s64>(request), static_cast<s64>(set), static_cast<s64>(link),
+                      kind, static_cast<s64>(container), count, count > 32});
+    for (u32 i = 0; array != 0 && i < count && i < 32; ++i) {
+        const u64 condition = Word(array + i * 8);
+        PadTrace::Record("DMC_GATE_RELATION",
+                         {static_cast<s64>(request), static_cast<s64>(set), static_cast<s64>(link),
+                          kind, i, static_cast<s64>(condition), static_cast<s64>(container)});
+        GateConditionDetails(request, condition);
+    }
+}
+
+void GateTopology(u64 request, u64 set, u64 descriptor) {
+    for (auto& entry : native_cache.topologies) {
+        if (entry[0] == set && entry[1] == descriptor) {
+            return;
+        }
+        if (entry[0] == 0) {
+            entry = {set, descriptor};
+            GateRelations(request, set, 0, 0, Word(set + 0x70));
+            const u64 array = Word(set + 0x60);
+            u32 count = 0;
+            Read(set + 0x68, &count, sizeof(count));
+            PadTrace::Record("DMC_GATE_TOPOLOGY",
+                             {static_cast<s64>(request), static_cast<s64>(set),
+                              static_cast<s64>(descriptor), count, count > 64});
+            for (u32 i = 0; array != 0 && i < count && i < 64; ++i) {
+                const u64 link = Word(array + i * 8);
+                const u64 definition = link != 0 ? Word(link + 0x60) : 0;
+                if (definition == 0 || Word(definition + 0x68) != descriptor) {
+                    continue;
+                }
+                const u64 target = Word(link + 0x70);
+                const u64 conditions = Word(link + 0x78);
+                PadTrace::Record("DMC_GATE_LINK",
+                                 {static_cast<s64>(request), static_cast<s64>(set),
+                                  static_cast<s64>(link), static_cast<s64>(definition),
+                                  static_cast<s64>(target), static_cast<s64>(Word(link + 0x68)),
+                                  static_cast<s64>(conditions)});
+                Identity(request, link);
+                Identity(request, definition);
+                Identity(request, target);
+                GateRelations(request, set, link, 1, definition);
+                GateRelations(request, set, link, 2, conditions);
+            }
+            return;
+        }
+    }
+    PadTrace::Record("DMC_GATE_TOPOLOGY_LIMIT", {64, static_cast<s64>(set)});
+}
+
+void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* parameters,
+                                           void* result) {
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    auto* trace = active_gate;
+    if (trace == nullptr || parameters == nullptr ||
+        (caller != guest_base + 0xa2090c && caller != guest_base + 0xa235b9)) {
+        return native_condition_dispatch(object, function, parameters, result);
+    }
+    const u64 address = reinterpret_cast<u64>(parameters);
+    ConditionResult observed{};
+    observed.object = reinterpret_cast<u64>(object);
+    observed.function = reinterpret_cast<u64>(function);
+    observed.context = LiveWord(address + 8);
+    observed.pawn = LiveWord(address + 16);
+    observed.caller = caller;
+    native_condition_dispatch(object, function, parameters, result);
+    observed.result = LiveDword(address + 24);
+    auto& results = trace->results;
+    if (results.condition_count < results.conditions.size()) {
+        results.conditions[results.condition_count++] = observed;
+    } else {
+        results.clipped |= 1;
+    }
+}
+
+u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
+    auto* trace = active_gate;
+    if (trace == nullptr || definition == nullptr ||
+        LiveWord(reinterpret_cast<u64>(definition) + 0x68) != trace->descriptor) {
+        return native_match_event(definition, event);
+    }
+    const u32 result = native_match_event(definition, event);
+    auto& results = trace->results;
+    if (results.match_count < results.matches.size()) {
+        results.matches[results.match_count++] = {reinterpret_cast<u64>(definition), result};
+    } else {
+        results.clipped |= 2;
+    }
+    return result;
+}
+
+void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
+    if (!PadTrace::Enabled() || event == nullptr) {
+        return native_select_link(set, event);
+    }
+    ResetNativeCache();
+    if (native_cache.gate_records >= 256 || native_cache.gun_descriptor == 0) {
+        return native_select_link(set, event);
+    }
+    const u64 event_address = reinterpret_cast<u64>(event);
+    const u64 descriptor = LiveWord(event_address + 0x60);
+    if (descriptor != native_cache.gun_descriptor &&
+        !(native_cache.aggregate_request != 0 && native_cache.aggregate_type == 0 &&
+          (native_cache.aggregate_held & 8) != 0)) {
+        return native_select_link(set, event);
+    }
+    const u32 type = *reinterpret_cast<const u8*>(event_address + 0x78);
+    GateTrace trace{descriptor};
+    auto* previous = active_gate;
+    active_gate = &trace;
+    void* selected = native_select_link(set, event);
+    active_gate = previous;
+    if (selected == nullptr && trace.results.condition_count == 0 &&
+        trace.results.match_count == 0) {
+        return selected;
+    }
+    const u64 address = reinterpret_cast<u64>(set);
+    const u64 selected_address = reinterpret_cast<u64>(selected);
+    GateSample* sample = nullptr;
+    const auto start = ((address >> 4) ^ (descriptor >> 4) ^ type) % native_cache.gates.size();
+    for (std::size_t i = 0; i < native_cache.gates.size(); ++i) {
+        auto& candidate = native_cache.gates[(start + i) % native_cache.gates.size()];
+        if (candidate.set == 0 || (candidate.set == address && candidate.descriptor == descriptor &&
+                                   candidate.type == type)) {
+            sample = &candidate;
+            break;
+        }
+    }
+    if (sample == nullptr) {
+        native_cache.gate_records = 256;
+        PadTrace::Record("DMC_NATIVE_LIMIT", {13, 128});
+        return selected;
+    }
+    const bool repeated = sample->set == address && sample->descriptor == descriptor &&
+                          sample->type == type && sample->epoch == native_cache.gun_epoch &&
+                          sample->selected == selected_address && sample->results == trace.results;
+    *sample = {address, descriptor, selected_address, type, native_cache.gun_epoch, trace.results};
+    if (repeated) {
+        return selected;
+    }
+    ++native_cache.gate_records;
+    const u64 request = PadTrace::NextId();
+    PadTrace::Record("DMC_GATE_SELECT",
+                     {static_cast<s64>(request), static_cast<s64>(address),
+                      static_cast<s64>(descriptor), type, static_cast<s64>(selected_address),
+                      trace.results.condition_count, trace.results.match_count,
+                      trace.results.clipped, native_cache.gun_epoch,
+                      static_cast<s64>(native_cache.aggregate_request),
+                      reinterpret_cast<s64>(__builtin_return_address(0))});
+    GateTopology(request, address, descriptor);
+    Identity(request, selected_address);
+    for (u32 i = 0; i < trace.results.condition_count; ++i) {
+        const auto& condition = trace.results.conditions[i];
+        PadTrace::Record("DMC_GATE_CONDITION",
+                         {static_cast<s64>(request), i, static_cast<s64>(condition.object),
+                          static_cast<s64>(condition.function), static_cast<s64>(condition.context),
+                          static_cast<s64>(condition.pawn), condition.result,
+                          static_cast<s64>(condition.caller),
+                          condition.function != 0 ? LiveDword(condition.function + 0xd0) : 0});
+        Identity(request, condition.object);
+        Identity(request, condition.function);
+        Identity(request, condition.context);
+    }
+    for (u32 i = 0; i < trace.results.match_count; ++i) {
+        const auto& match = trace.results.matches[i];
+        PadTrace::Record("DMC_GATE_MATCH", {static_cast<s64>(request), i,
+                                            static_cast<s64>(match.definition), match.result});
+    }
+    if (native_cache.gate_records == 256) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {11, 256});
+    }
+    return selected;
+}
+
+void PS4_SYSV_ABI ObserveNodeExit(void* object, void* graph, void* node) {
+    if (!PadTrace::Enabled()) {
+        return native_node_exit(object, graph, node);
+    }
+    ResetNativeCache();
+    const u64 address = reinterpret_cast<u64>(object);
+    if (native_cache.exit_records >= 64 || LiveDword(address + 0x80) == 0) {
+        return native_node_exit(object, graph, node);
+    }
+    const auto before = SnapshotBuffer(address + 0x78);
+    const u64 node_address = reinterpret_cast<u64>(node);
+    const u32 state = node != nullptr ? LiveDword(node_address + 0xd0) : 0;
+    const u32 flags = node != nullptr ? LiveDword(node_address + 0xb4) : 0;
+    const u32 internal = LiveDword(address + 0xd8);
+    native_node_exit(object, graph, node);
+    const auto after = SnapshotBuffer(address + 0x78);
+    if (before == after) {
+        return;
+    }
+    ++native_cache.exit_records;
+    const u64 request = PadTrace::NextId();
+    PadTrace::Record("DMC_NODE_EXIT", {static_cast<s64>(request), static_cast<s64>(address),
+                                       reinterpret_cast<s64>(graph), static_cast<s64>(node_address),
+                                       reinterpret_cast<s64>(__builtin_return_address(0)),
+                                       static_cast<s64>(native_cache.aggregate_request),
+                                       before.owner == node_address, state, flags, internal});
+    BufferState(request, 0, before);
+    BufferState(request, 1, after);
+    Identity(request, reinterpret_cast<u64>(graph));
+    Identity(request, node_address);
+    if (native_cache.exit_records == 64) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {12, 64});
+    }
 }
 
 u32 PS4_SYSV_ABI ObserveBufferEvent(void* buffer, void* owner, void* event, void* first,
@@ -712,6 +1026,9 @@ u32 AggregateContext(u64 request, void* event) {
     }
     const u32 type = input ? *reinterpret_cast<const u8*>(address + 0x78) : 0;
     const u32 held = input ? LiveDword(address + 0xa0) : 0;
+    if (input && type == 2 && held == 8 && native_cache.gun_descriptor == 0) {
+        native_cache.gun_descriptor = LiveWord(address + 0x60);
+    }
     PadTrace::Record("DMC_AGG_CONTEXT",
                      {static_cast<s64>(request), static_cast<s64>(address),
                       static_cast<s64>(event_class), input, type, held,
@@ -732,7 +1049,8 @@ u32 PS4_SYSV_ABI ObserveAggregateEvent(void* object, void* event, u32 input) {
     const auto before = SnapshotBuffer(reinterpret_cast<u64>(object) + 0x78);
     u32 result = 0;
     {
-        const AggregateScope scope{request, type};
+        const AggregateScope scope{
+            request, type, type != 256 ? LiveDword(reinterpret_cast<u64>(event) + 0xa0) : 0};
         result = native_aggregate_event(object, event, input);
     }
     AggregateState("DMC_AGG_EVENT_END", request, object, event, input, caller, result);
@@ -1039,15 +1357,36 @@ void InstallNative() {
         NativeEntry(base + 0xa1e2c0, reinterpret_cast<u64>(&ObserveActiveSwitch), active_bytes));
     native_buffer_switch = reinterpret_cast<OwnerSwitch>(NativeEntry(
         base + 0xa1e510, reinterpret_cast<u64>(&ObserveBufferSwitch), buffer_switch_bytes));
+    auto select_bytes = event_bytes;
+    select_bytes.back() = 0x38;
+    auto dispatch_bytes = event_bytes;
+    dispatch_bytes.back() = 0x58;
+    constexpr std::array<u8, 14> match_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                             0x56, 0x41, 0x54, 0x53, 0x49, 0x89, 0xf7};
+    constexpr std::array<u8, 16> exit_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                            0x53, 0x50, 0x49, 0x89, 0xf6, 0x49, 0x89, 0xff};
+    native_match_event = reinterpret_cast<GraphEvent>(
+        NativeEntry(base + 0xa26420, reinterpret_cast<u64>(&ObserveGateMatch), match_bytes));
+    native_condition_dispatch = reinterpret_cast<ConditionDispatch>(NativeEntry(
+        base + 0x6d1e0, reinterpret_cast<u64>(&ObserveConditionDispatch), dispatch_bytes));
+    if (native_match_event != nullptr && native_condition_dispatch != nullptr) {
+        native_select_link = reinterpret_cast<SelectLink>(
+            NativeEntry(base + 0xa20850, reinterpret_cast<u64>(&ObserveSelectLink), select_bytes));
+    }
+    native_node_exit = reinterpret_cast<NodeExit>(
+        NativeEntry(base + 0xa1e650, reinterpret_cast<u64>(&ObserveNodeExit), exit_bytes));
     LOG_INFO(Input, "[DMC TRACE] Native probes before guest execution: held={}, node_clear={}",
              native_held != nullptr, native_clear != nullptr);
     LOG_INFO(Input, "[DMC TRACE] Aggregator probes: event={}, clear={}, flush={}",
              native_aggregate_event != nullptr, native_aggregate_clear != nullptr,
              native_aggregate_flush != nullptr);
-    LOG_INFO(Input, "[DMC TRACE] Sparse handoff probes: buffer={}, graph={}; match/select disabled",
+    LOG_INFO(Input, "[DMC TRACE] Sparse handoff probes: buffer={}, graph={}",
              native_buffer_event != nullptr, native_graph_event != nullptr);
     LOG_INFO(Input, "[DMC TRACE] Pending ownership probes: active={}, buffer={}",
              native_active_switch != nullptr, native_buffer_switch != nullptr);
+    LOG_INFO(Input, "[DMC TRACE] Filtered gate probes: select={}, match={}, condition={}, exit={}",
+             native_select_link != nullptr, native_match_event != nullptr,
+             native_condition_dispatch != nullptr, native_node_exit != nullptr);
 }
 
 void Install() {
@@ -1058,9 +1397,12 @@ void Install() {
                       native_aggregate_flush != nullptr});
     PadTrace::Record("DMC_HANDOFF_HOOK",
                      {native_buffer_event != nullptr, native_graph_event != nullptr, 0, 0});
-    PadTrace::Record("DMC_HANDOFF_SPARSE", {1, 256, 512, 96});
+    PadTrace::Record("DMC_HANDOFF_SPARSE", {1, 256, 512, 256});
     PadTrace::Record("DMC_OWNER_HOOK",
                      {native_active_switch != nullptr, native_buffer_switch != nullptr});
+    PadTrace::Record("DMC_GATE_HOOK", {native_select_link != nullptr, native_match_event != nullptr,
+                                       native_condition_dispatch != nullptr,
+                                       native_node_exit != nullptr, 256, 32, 32, 64});
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;

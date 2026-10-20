@@ -377,6 +377,46 @@ L2 0x100, R2 0x200, L1 0x400, R1 0x800; intercepted 0x80000000.
 
 ## Analysis
 
+### Current DmC condition-gate capture (2026-10-20)
+
+This remains diagnosis, not a charge fix. Game files and input semantics are unchanged.
+Use the diagnostic executable, not baseline. Capture one F9 segment containing
+**success -> failure -> success**, keeping the gun held long enough in every attempt.
+For failure, melee near the end of the initial shot; for success, delay melee. Release
+all controls between attempts. Stop F9 and exit normally. No extra weapon/controller
+matrix is required unless requested. Use shotgun or dual pistols, not the explosive gun.
+
+The new probes filter transition searches to the tracked held-gun descriptor and pressed
+inputs delivered while the gun is held. They collect event-match outcomes and actual
+IsSatisfied returns into fixed local arrays, then emit changed results or a new observed
+gun hold. No global VM instruction stream is recorded. The shared ProcessEvent wrapper
+delegates immediately outside a traced search. Call overhead remains and must be checked
+on the game machine. Records are emitted after calls, not at condition-call entry times.
+
+The gun descriptor is learned from a held event with DV mask 8. Verify its DMC_OBJECT name
+is DVButton_RangedAttack. DMC_GATE_HOOK reports all four installed probes. Missing hooks,
+clipped arrays and exhausted budgets limit conclusions. Condition returns cover the two
+validated native evaluation sites, not every nested expression/native event-condition leaf.
+
+| kind | p0 onwards, in order |
+| --- | --- |
+| DMC_GATE_HOOK | select, match, condition dispatch, node exit installed; selection budget, condition capacity, match capacity, topology capacity |
+| DMC_GATE_SELECT | request, set, descriptor, input type, selected link (0 rejected), condition count, match count, clipping bits (1 conditions, 2 matches), gun-hold epoch, aggregate parent, caller |
+| DMC_GATE_CONDITION | request, index, condition object, function, context, pawn, returned bool word, caller, function flags raw |
+| DMC_GATE_MATCH | request, index, event definition, returned bool word |
+| DMC_GATE_TOPOLOGY | request, set, descriptor, total links, links clipped |
+| DMC_GATE_LINK | request, set, link, event definition, target node, graph, script-condition container |
+| DMC_GATE_RELATION_SET | request, set, link (0 common), kind (0 common script, 1 event match, 2 link script), container, total conditions, conditions clipped |
+| DMC_GATE_RELATION | request, set, link, kind, index, condition object, container |
+| DMC_GATE_DEFINITION | request, condition object, virtual slot 0x248 raw, virtual slot 0x250 raw |
+| DMC_GATE_TOKEN | request, condition object, index (0 primary), packed expected token FName, expected presence, total additional checks (at most 8 emitted) |
+| DMC_NODE_EXIT | request, aggregator, outgoing graph, outgoing node, direct caller, aggregate parent, buffer owner matched node, node state raw, node flags raw, internal counter |
+
+DMC_NODE_EXIT shares before/after DMC_BUFFER and DMC_BUFFER_ITEM records. Token records
+describe configuration, not separately measured presence. Topology is discovered once per
+set/descriptor pair per capture. Native limit kinds 11/12/13 indicate gate emissions,
+node exits, or gate-key cache exhaustion. DMC_GATE_TOPOLOGY_LIMIT reports topology capacity.
+
 `python padtrace_summary.py padtrace-v2-SESSION.csv --output summary.json`
 
 The standard-library-only helper reports sample age, API read gaps per thread/handle, queue

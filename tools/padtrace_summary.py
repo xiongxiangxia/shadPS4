@@ -67,6 +67,12 @@ def summarize(path):
     owner_switches = []
     owner_stacks = {}
     game_clocks = []
+    gate_hooks = []
+    gate_selections = []
+    gate_conditions = []
+    gate_matches = []
+    gate_metadata = []
+    node_exits = []
 
     def lines(stream):
         nonlocal dropped, limit_reached, revision
@@ -132,6 +138,36 @@ def summarize(path):
                 read_callers[hex(p[2])] += 1
             elif kind == "DMC_HANDOFF_SPARSE":
                 handoff_sparse = bool(p[0])
+            elif kind == "DMC_GATE_HOOK":
+                gate_hooks.append({"monotonic_us": timestamp, "installed": p[:4],
+                                   "budgets_raw": p[4:8]})
+            elif kind == "DMC_GATE_SELECT" and len(gate_selections) < 256:
+                gate_selections.append({
+                    "monotonic_us": timestamp, "request": p[0], "set": hex(p[1]),
+                    "descriptor": hex(p[2]), "type": p[3], "selected_link": hex(p[4]),
+                    "condition_count": p[5], "match_count": p[6], "clipped_raw": p[7],
+                    "gun_epoch": p[8], "parent": p[9], "caller": hex(p[10]),
+                })
+            elif kind == "DMC_GATE_CONDITION" and len(gate_conditions) < 8192:
+                gate_conditions.append({
+                    "request": p[0], "index": p[1], "condition": hex(p[2]),
+                    "function": hex(p[3]), "context": hex(p[4]), "pawn": hex(p[5]),
+                    "result": p[6], "caller": hex(p[7]), "function_flags_raw": p[8],
+                })
+            elif kind == "DMC_GATE_MATCH" and len(gate_matches) < 8192:
+                gate_matches.append({"request": p[0], "index": p[1],
+                                     "definition": hex(p[2]), "result": p[3]})
+            elif kind in ("DMC_GATE_TOPOLOGY", "DMC_GATE_LINK", "DMC_GATE_RELATION_SET",
+                          "DMC_GATE_RELATION", "DMC_GATE_TOKEN", "DMC_GATE_DEFINITION",
+                          "DMC_GATE_TOPOLOGY_LIMIT") and len(gate_metadata) < 4096:
+                gate_metadata.append({"kind": kind, "request": p[0], "payload_raw": p[1:8]})
+            elif kind == "DMC_NODE_EXIT" and len(node_exits) < 64:
+                node_exits.append({
+                    "monotonic_us": timestamp, "request": p[0], "aggregator": hex(p[1]),
+                    "graph": hex(p[2]), "node": hex(p[3]), "caller": hex(p[4]),
+                    "parent": p[5], "buffer_owner_matched": bool(p[6]),
+                    "node_state_flags_raw": p[7:9], "internal_counter": p[9],
+                })
             elif kind == "DMC_OWNER_SWITCH" and len(owner_switches) < 64:
                 owner_switches.append({
                     "monotonic_us": timestamp, "request": p[0], "path": p[1],
@@ -316,6 +352,12 @@ def summarize(path):
         "dmc_owner_switches": owner_switches,
         "dmc_owner_stacks": owner_stacks,
         "dmc_game_clock_samples_first_200": game_clocks,
+        "dmc_gate_hooks": gate_hooks,
+        "dmc_gate_selections_first_256": gate_selections,
+        "dmc_gate_conditions_first_8192": gate_conditions,
+        "dmc_gate_matches_first_8192": gate_matches,
+        "dmc_gate_metadata_first_4096": gate_metadata,
+        "dmc_node_exits_first_64": node_exits,
         "dmc_handoff_duration_note": "Sparse CALL/END timestamps cover emission, not game execution"
         if handoff_sparse else "Detailed CALL/END timestamps include instrumentation overhead",
         "dmc_handoffs_first_2000": handoffs,
