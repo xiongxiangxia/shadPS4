@@ -379,6 +379,33 @@ L2 0x100, R2 0x200, L1 0x400, R1 0x800; intercepted 0x80000000.
 
 ### Current DmC condition-gate capture (2026-10-20)
 
+The follow-up build also traces the shot's existing scheduled callbacks when its action
+starts, including callbacks configured before F9. HolsterWeapon is identified by its runtime
+FName and restricted to the player's input aggregator. It captures the callback's configured
+relative time, the player's action-timeline delta/time, the actual HolsterWeapon/lifecycle
+dispatch when available, and SetState_Awake's calling script and buffer state. These are
+observations only. A late/missing callback is not established until discovery and hook status
+are checked. Only the latest discovered firing action is tracked, so a new shot replaces the
+previous shot's timer watch. Additional schedules created after action start are not inventoried.
+
+Broad topology discovery is now OFF by default. Previously collected class/graph metadata
+is sufficient for the current timer investigation. Actual gate results and condition identities
+remain enabled. Set SHADPS4_DMC_TOPOLOGY=1 only when a fresh full relation inventory is needed.
+The DMC_FIRE_HOOK record includes this setting. No additional user test sequence is required.
+
+| kind | p0 onwards, in order |
+| --- | --- |
+| DMC_FIRE_HOOK | action-start, timeline-tick, awake installed; event budget, tick budget, sample interval ms, topology enabled |
+| DMC_FIRE_SCHEDULE | request, shot serial, action, node, timeline, callback object, packed callback FName, relative seconds bits, is HolsterWeapon, index, total, params, aggregate parent, timeline time before/after start bits, scheduled flags raw, inventory clipped |
+| DMC_FIRE_START / DMC_FIRE_CALLBACK_BEGIN / DMC_FIRE_CALLBACK_END / DMC_FIRE_AWAKE_BEGIN / DMC_FIRE_AWAKE_END | request, shot serial, action, node, timeline, timeline time bits, node state, node flags, buffer count, buffer owner, script FName, action flags raw, action run-time bits |
+| DMC_FIRE_TICK | shot serial, timeline, delta bits, timeline time before/after tick bits, callback still pending, remaining scheduled items |
+
+All float words are IEEE-754 single-precision bits. FireState names marked CALLBACK include
+the known native lifecycle call range, not only HolsterWeapon; inspect the script FName.
+Timeline ticks are sampled every 50 ms and at the observed end of the callback watch, not
+every frame. Native limit kinds 14/15 indicate shot-event/timeline-sample budget exhaustion.
+The regular frame and pad probes remain available to assess timing interference.
+
 This remains diagnosis, not a charge fix. Game files and input semantics are unchanged.
 Use the diagnostic executable, not baseline. Capture one F9 segment containing
 **success -> failure -> success**, keeping the gun held long enough in every attempt.
