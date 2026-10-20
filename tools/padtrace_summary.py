@@ -77,6 +77,9 @@ def summarize(path):
     fire_schedules = []
     fire_states = []
     fire_ticks = []
+    fire_items = []
+    fire_origins = []
+    fire_commands = []
 
     def float_word(value):
         return struct.unpack("<f", (value & 0xffffffff).to_bytes(4, "little"))[0]
@@ -151,7 +154,8 @@ def summarize(path):
             elif kind == "DMC_FIRE_HOOK":
                 fire_hooks.append({"monotonic_us": timestamp, "installed": p[:3],
                                    "event_budget": p[3], "tick_budget": p[4],
-                                   "sample_interval_ms": p[5], "topology_enabled": bool(p[6])})
+                                   "sample_interval_ms": p[5], "topology_enabled": bool(p[6]),
+                                   "item_hook": bool(p[7]), "item_budget_per_shot": p[8]})
             elif kind == "DMC_FIRE_SCHEDULE" and len(fire_schedules) < 2048:
                 fire_schedules.append({
                     "monotonic_us": timestamp, "request": p[0], "serial": p[1],
@@ -161,9 +165,13 @@ def summarize(path):
                     "index": p[9], "total": p[10], "params": hex(p[11]), "parent": p[12],
                     "timeline_before_after_s": [float_word(p[13]), float_word(p[14])],
                     "flags_raw": p[15], "clipped": bool(p[16]),
+                    "kind_raw": p[17], "command": hex(p[18]), "token_raw": p[19],
+                    "condition": hex(p[20]), "repeat_count_raw": p[21],
+                    "repeat_interval_s": float_word(p[22]),
                 })
             elif kind in ("DMC_FIRE_START", "DMC_FIRE_CALLBACK_BEGIN", "DMC_FIRE_CALLBACK_END",
-                          "DMC_FIRE_AWAKE_BEGIN", "DMC_FIRE_AWAKE_END") and len(fire_states) < 512:
+                          "DMC_FIRE_AWAKE_BEGIN", "DMC_FIRE_AWAKE_END",
+                          "DMC_FIRE_ITEM_END") and len(fire_states) < 1024:
                 fire_states.append({
                     "monotonic_us": timestamp, "kind": kind, "request": p[0], "serial": p[1],
                     "action": hex(p[2]), "node": hex(p[3]), "timeline": hex(p[4]),
@@ -171,12 +179,37 @@ def summarize(path):
                     "buffer_count": p[8], "buffer_owner": hex(p[9]), "script_name_raw": p[10],
                     "action_flags_raw": p[11], "action_run_time_s": float_word(p[12]),
                 })
-            elif kind == "DMC_FIRE_TICK" and len(fire_ticks) < 128:
+            elif kind == "DMC_FIRE_TICK" and len(fire_ticks) < 512:
                 fire_ticks.append({
                     "monotonic_us": timestamp, "serial": p[0], "timeline": hex(p[1]),
                     "delta_s": float_word(p[2]),
                     "timeline_before_after_s": [float_word(p[3]), float_word(p[4])],
                     "pending": bool(p[5]), "remaining_items": p[6],
+                })
+            elif kind == "DMC_FIRE_ITEM_BEGIN" and len(fire_items) < 512:
+                fire_items.append({
+                    "monotonic_us": timestamp, "request": p[0], "serial": p[1],
+                    "timeline": hex(p[2]), "entry": hex(p[3]),
+                    "timeline_time_s": float_word(p[4]), "callback_object": hex(p[5]),
+                    "callback_name_raw": p[6], "command": hex(p[7]), "token_raw": p[8],
+                    "argument_raw": p[9], "condition": hex(p[10]),
+                    "relative_time_s": float_word(p[11]), "repeat_count_raw": p[12],
+                    "repeat_interval_s": float_word(p[13]), "kind_raw": p[14],
+                    "flags_raw": p[15], "parent": p[16], "tick_delta_s": float_word(p[17]),
+                })
+            elif kind == "DMC_FIRE_AWAKE_ORIGIN" and len(fire_origins) < 128:
+                fire_origins.append({
+                    "monotonic_us": timestamp, "request": p[0], "serial": p[1],
+                    "function": hex(p[2]), "function_outer": hex(p[3]), "context": hex(p[4]),
+                    "code": hex(p[5]), "item_request": p[6], "parent": p[7],
+                    "tick_delta_s": float_word(p[8]),
+                })
+            elif kind == "DMC_FIRE_COMMAND" and len(fire_commands) < 128:
+                fire_commands.append({
+                    "monotonic_us": timestamp, "request": p[0], "serial": p[1],
+                    "command": hex(p[2]), "function": hex(p[3]), "function_outer": hex(p[4]),
+                    "caller": hex(p[5]), "item_request": p[6], "parent": p[7],
+                    "timeline_time_s": float_word(p[8]), "tick_delta_s": float_word(p[9]),
                 })
             elif kind == "DMC_GATE_SELECT" and len(gate_selections) < 256:
                 gate_selections.append({
@@ -376,6 +409,8 @@ def summarize(path):
         obj["name"] = names.get(obj["name_index"])
     for item in fire_schedules:
         item["callback_name"] = names.get(item["callback_name_raw"] & 0xffffffff)
+    for item in fire_items:
+        item["callback_name"] = names.get(item["callback_name_raw"] & 0xffffffff)
     for item in fire_states:
         item["script_name"] = names.get(item["script_name_raw"] & 0xffffffff)
 
@@ -401,8 +436,13 @@ def summarize(path):
         "dmc_node_exits_first_64": node_exits,
         "dmc_fire_hooks": fire_hooks,
         "dmc_fire_schedules_first_2048": fire_schedules,
-        "dmc_fire_states_first_512": fire_states,
-        "dmc_fire_ticks_first_128": fire_ticks,
+        "dmc_fire_states_first_512": fire_states[:512],
+        "dmc_fire_states_first_1024": fire_states,
+        "dmc_fire_ticks_first_128": fire_ticks[:128],
+        "dmc_fire_ticks_first_512": fire_ticks,
+        "dmc_fire_items_first_512": fire_items,
+        "dmc_fire_origins_first_128": fire_origins,
+        "dmc_fire_commands_first_128": fire_commands,
         "dmc_handoff_duration_note": "Sparse CALL/END timestamps cover emission, not game execution"
         if handoff_sparse else "Detailed CALL/END timestamps include instrumentation overhead",
         "dmc_handoffs_first_2000": handoffs,

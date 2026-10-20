@@ -395,10 +395,32 @@ The DMC_FIRE_HOOK record includes this setting. No additional user test sequence
 
 | kind | p0 onwards, in order |
 | --- | --- |
-| DMC_FIRE_HOOK | action-start, timeline-tick, awake installed; event budget, tick budget, sample interval ms, topology enabled |
-| DMC_FIRE_SCHEDULE | request, shot serial, action, node, timeline, callback object, packed callback FName, relative seconds bits, is HolsterWeapon, index, total, params, aggregate parent, timeline time before/after start bits, scheduled flags raw, inventory clipped |
+| DMC_FIRE_HOOK | action-start, timeline-tick, awake installed; event budget, tick budget per shot, sample interval ms, topology enabled, item-dispatch installed, item budget per shot |
+| DMC_FIRE_SCHEDULE | request, shot serial, action, node, timeline, callback object, packed callback FName, relative seconds bits, is HolsterWeapon, index, total, params, aggregate parent, timeline time before/after start bits, scheduled flags byte, inventory clipped, item kind byte, command pointer, token raw, condition pointer, repeat count raw, repeat interval bits |
 | DMC_FIRE_START / DMC_FIRE_CALLBACK_BEGIN / DMC_FIRE_CALLBACK_END / DMC_FIRE_AWAKE_BEGIN / DMC_FIRE_AWAKE_END | request, shot serial, action, node, timeline, timeline time bits, node state, node flags, buffer count, buffer owner, script FName, action flags raw, action run-time bits |
 | DMC_FIRE_TICK | shot serial, timeline, delta bits, timeline time before/after tick bits, callback still pending, remaining scheduled items |
+| DMC_FIRE_ITEM_BEGIN | request, shot serial, timeline, item address, timeline time bits, callback object, callback FName, command pointer, token raw, argument raw, condition pointer, relative time bits, repeat count raw, repeat interval bits, item kind byte, flags byte, aggregate parent, active tick delta bits |
+| DMC_FIRE_ITEM_END | same fields as DMC_FIRE_START, sharing the item-dispatch request |
+| DMC_FIRE_AWAKE_ORIGIN | awake request, shot serial, executing function, function outer, FFrame context object, bytecode position, active item request (0 outside tracked dispatch), aggregate parent, active tick delta bits |
+| DMC_FIRE_COMMAND | request, shot serial, command object, OnExecute function, function outer, native caller, active item request, aggregate parent, timeline time bits, active tick delta bits |
+
+The command records cover the validated native command-to-OnExecute call site for the
+tracked firing pawn, while the shot is pending. Awake origin also identifies the actual
+script and context object when there is no tracked timeline dispatch. Scheduled payloads
+are tagged unions: interpret command/token fields only for their corresponding item kind.
+Inventory now includes up to 64 items rather than 16. Dispatch records mean the item
+reached the dispatcher, not that its optional condition passed or its effect completed.
+
+Tick and item budgets restart per shot. Sampling stops when the tracked node is awakened
+or the firing action is cleaned up/interrupted; later reuse of its timeline is not treated
+as the original pending shot. Native limit 15 includes the shot serial; limit 16 reports
+the 64-item dispatch cap. The analyzer retains up to 512 ticks and 1024 fire states, with
+the earlier first-128/first-512 keys kept as bounded compatibility views.
+
+Timeline time is advanced after callbacks. Compare a callback against the current tick's
+time plus delta, not just the pre-advance clock. Item relative time is not necessarily the
+absolute deadline when an item was registered on an already-running timeline. No input,
+charge threshold, command scheduling or cleanup behavior is changed by these probes.
 
 All float words are IEEE-754 single-precision bits. FireState names marked CALLBACK include
 the known native lifecycle call range, not only HolsterWeapon; inspect the script FName.

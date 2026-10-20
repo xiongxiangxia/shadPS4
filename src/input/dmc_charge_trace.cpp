@@ -46,6 +46,7 @@ ConditionDispatch native_condition_dispatch = nullptr;
 NodeExit native_node_exit = nullptr;
 AggregateOperation native_fire_start = nullptr;
 TimelineTick native_timeline_tick = nullptr;
+OwnerSwitch native_timeline_item = nullptr;
 Native native_awake = nullptr;
 bool discover_topology = false;
 std::atomic<Native> original;
@@ -336,6 +337,9 @@ struct NativeCache {
     u32 fire_serial = 0;
     u32 fire_records = 0;
     u32 timeline_records = 0;
+    u32 item_records = 0;
+    u64 timeline_item_request = 0;
+    u32 timeline_delta = 0;
     bool fire_pending = false;
     std::chrono::steady_clock::time_point timeline_recorded{};
     std::array<GateSample, 128> gates{};
@@ -705,13 +709,19 @@ void PS4_SYSV_ABI ObserveFireStart(void* action) {
         u32 seconds = 0;
         u32 flags = 0;
     };
-    std::array<Scheduled, 16> items{};
+    std::array<Scheduled, 64> items{};
+    std::array<std::array<u64, 3>, 64> payloads{};
+    std::array<std::array<u32, 3>, 64> controls{};
     const u64 array = Word(address + 0x80);
     const u32 count = LiveDword(address + 0x88);
     u64 holster = 0;
     for (u32 i = 0; array != 0 && i < count && i < items.size(); ++i) {
         const u64 entry = array + i * 0x48;
-        items[i] = {Word(entry), Word(entry + 8), LiveDword(entry + 0x30), LiveDword(entry + 0x40)};
+        items[i] = {Word(entry), Word(entry + 8), LiveDword(entry + 0x30),
+                    LiveDword(entry + 0x40) & 0xff};
+        payloads[i] = {Word(entry + 0x10), Word(entry + 0x18), Word(entry + 0x28)};
+        controls[i] = {LiveDword(entry + 0x3c) & 0xff, LiveDword(entry + 0x34),
+                       LiveDword(entry + 0x38)};
         if (native_cache.holster_name != 0
                 ? items[i].name == native_cache.holster_name
                 : NameIs(static_cast<u32>(items[i].name), "HolsterWeapon")) {
@@ -728,6 +738,8 @@ void PS4_SYSV_ABI ObserveFireStart(void* action) {
     native_cache.fire_timeline = timeline;
     native_cache.holster_name = holster;
     native_cache.fire_pending = true;
+    native_cache.timeline_records = 0;
+    native_cache.item_records = 0;
     native_cache.timeline_recorded = {};
     ++native_cache.fire_serial;
     native_fire_start(action);
@@ -735,15 +747,33 @@ void PS4_SYSV_ABI ObserveFireStart(void* action) {
     ++native_cache.fire_records;
     for (u32 i = 0; i < count && i < items.size(); ++i) {
         const auto& item = items[i];
-        PadTrace::Record(
-            "DMC_FIRE_SCHEDULE",
-            {static_cast<s64>(request), native_cache.fire_serial, static_cast<s64>(address),
-             static_cast<s64>(node), static_cast<s64>(timeline), static_cast<s64>(item.callback),
-             static_cast<s64>(item.name), item.seconds, item.name == holster, i, count,
-             static_cast<s64>(Word(address + 0x78)),
-             static_cast<s64>(native_cache.aggregate_request), time_before,
-             timeline != 0 ? LiveDword(timeline + 0x8c) : 0, item.flags, count > items.size()});
+        PadTrace::Record("DMC_FIRE_SCHEDULE", {static_cast<s64>(request),
+                                               native_cache.fire_serial,
+                                               static_cast<s64>(address),
+                                               static_cast<s64>(node),
+                                               static_cast<s64>(timeline),
+                                               static_cast<s64>(item.callback),
+                                               static_cast<s64>(item.name),
+                                               item.seconds,
+                                               item.name == holster,
+                                               i,
+                                               count,
+                                               static_cast<s64>(Word(address + 0x78)),
+                                               static_cast<s64>(native_cache.aggregate_request),
+                                               time_before,
+                                               timeline != 0 ? LiveDword(timeline + 0x8c) : 0,
+                                               item.flags,
+                                               count > items.size(),
+                                               controls[i][0],
+                                               static_cast<s64>(payloads[i][0]),
+                                               static_cast<s64>(payloads[i][1]),
+                                               static_cast<s64>(payloads[i][2]),
+                                               controls[i][1],
+                                               controls[i][2]});
         NameSite(static_cast<u32>(item.name));
+        if (controls[i][0] == 2) {
+            Identity(request, payloads[i][0]);
+        }
     }
     Identity(request, address);
     Identity(request, node);
@@ -766,7 +796,10 @@ void PS4_SYSV_ABI ObserveTimelineTick(void* object, float delta) {
     }
     const u32 before = LiveDword(address + 0x8c);
     const u32 serial = native_cache.fire_serial;
+    const u32 previous_delta = native_cache.timeline_delta;
+    native_cache.timeline_delta = FloatWord(delta);
     native_timeline_tick(object, delta);
+    native_cache.timeline_delta = previous_delta;
     const auto now = std::chrono::steady_clock::now();
     if (!native_cache.fire_pending ||
         now - native_cache.timeline_recorded >= std::chrono::milliseconds{50}) {
@@ -776,8 +809,41 @@ void PS4_SYSV_ABI ObserveTimelineTick(void* object, float delta) {
                                            before, LiveDword(address + 0x8c),
                                            native_cache.fire_pending, LiveDword(address + 0x98)});
         if (native_cache.timeline_records == 128) {
-            PadTrace::Record("DMC_NATIVE_LIMIT", {15, 128});
+            PadTrace::Record("DMC_NATIVE_LIMIT", {15, 128, serial});
         }
+    }
+}
+
+void PS4_SYSV_ABI ObserveTimelineItem(void* timeline, void* item) {
+    if (!PadTrace::Enabled()) {
+        return native_timeline_item(timeline, item);
+    }
+    ResetNativeCache();
+    const u64 address = reinterpret_cast<u64>(timeline);
+    if (address != native_cache.fire_timeline || !native_cache.fire_pending ||
+        native_cache.item_records >= 64) {
+        return native_timeline_item(timeline, item);
+    }
+    const u64 entry = reinterpret_cast<u64>(item);
+    const u64 request = PadTrace::NextId();
+    const u64 previous = native_cache.timeline_item_request;
+    native_cache.timeline_item_request = request;
+    ++native_cache.item_records;
+    PadTrace::Record(
+        "DMC_FIRE_ITEM_BEGIN",
+        {static_cast<s64>(request), native_cache.fire_serial, static_cast<s64>(address),
+         static_cast<s64>(entry), LiveDword(address + 0x8c), static_cast<s64>(Word(entry)),
+         static_cast<s64>(Word(entry + 8)), static_cast<s64>(Word(entry + 0x10)),
+         static_cast<s64>(Word(entry + 0x18)), static_cast<s64>(Word(entry + 0x20)),
+         static_cast<s64>(Word(entry + 0x28)), LiveDword(entry + 0x30), LiveDword(entry + 0x34),
+         LiveDword(entry + 0x38), LiveDword(entry + 0x3c) & 0xff, LiveDword(entry + 0x40) & 0xff,
+         static_cast<s64>(native_cache.aggregate_request), native_cache.timeline_delta});
+    native_timeline_item(timeline, item);
+    FireState("DMC_FIRE_ITEM_END", request, native_cache.fire_action, native_cache.fire_node,
+              address);
+    native_cache.timeline_item_request = previous;
+    if (native_cache.item_records == 64) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {16, 64, native_cache.fire_serial});
     }
 }
 
@@ -796,13 +862,23 @@ void PS4_SYSV_ABI ObserveAwake(void* node, void* frame, void* result) {
     const u64 action = native_cache.fire_action;
     const u64 timeline = native_cache.fire_timeline;
     ++native_cache.fire_records;
+    const u64 frame_address = reinterpret_cast<u64>(frame);
+    const u64 context = LiveWord(frame_address + 0x20);
+    const u64 outer = function != 0 ? Word(function + 0x40) : 0;
+    PadTrace::Record("DMC_FIRE_AWAKE_ORIGIN",
+                     {static_cast<s64>(request), native_cache.fire_serial,
+                      static_cast<s64>(function), static_cast<s64>(outer),
+                      static_cast<s64>(context), static_cast<s64>(LiveWord(frame_address + 0x28)),
+                      static_cast<s64>(native_cache.timeline_item_request),
+                      static_cast<s64>(native_cache.aggregate_request),
+                      native_cache.timeline_delta});
     FireState("DMC_FIRE_AWAKE_BEGIN", request, action, address, timeline, name);
     native_awake(node, frame, result);
     FireState("DMC_FIRE_AWAKE_END", request, action, address, timeline, name);
     NameSite(static_cast<u32>(name));
-    if (name == native_cache.holster_name) {
-        native_cache.fire_pending = false;
-    }
+    Identity(request, outer);
+    Identity(request, context);
+    native_cache.fire_pending = false;
     if (native_cache.fire_records == 128) {
         PadTrace::Record("DMC_NATIVE_LIMIT", {14, 128});
     }
@@ -902,6 +978,28 @@ void GateTopology(u64 request, u64 set, u64 descriptor) {
 void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* parameters,
                                            void* result) {
     const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    if (caller == guest_base + 0xa2a85c && parameters != nullptr && function != nullptr &&
+        PadTrace::Enabled()) {
+        ResetNativeCache();
+        if (native_cache.fire_pending && native_cache.fire_records < 128 &&
+            LiveWord(reinterpret_cast<u64>(parameters)) == Word(native_cache.fire_action + 0x70)) {
+            const u64 request = PadTrace::NextId();
+            const u64 address = reinterpret_cast<u64>(object);
+            const u64 script = reinterpret_cast<u64>(function);
+            ++native_cache.fire_records;
+            PadTrace::Record(
+                "DMC_FIRE_COMMAND",
+                {static_cast<s64>(request), native_cache.fire_serial, static_cast<s64>(address),
+                 static_cast<s64>(script), static_cast<s64>(Word(script + 0x40)),
+                 static_cast<s64>(caller), static_cast<s64>(native_cache.timeline_item_request),
+                 static_cast<s64>(native_cache.aggregate_request),
+                 LiveDword(native_cache.fire_timeline + 0x8c), native_cache.timeline_delta});
+            native_condition_dispatch(object, function, parameters, result);
+            Identity(request, address);
+            Identity(request, Word(script + 0x40));
+            return;
+        }
+    }
     if (reinterpret_cast<u64>(object) == native_cache.fire_action && function != nullptr &&
         native_cache.fire_records < 128 && PadTrace::Enabled()) {
         ResetNativeCache();
@@ -921,7 +1019,10 @@ void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* p
             native_condition_dispatch(object, function, parameters, result);
             FireState("DMC_FIRE_CALLBACK_END", request, action, node, timeline, name);
             NameSite(static_cast<u32>(name));
-            if (holster || NameIs(static_cast<u32>(name), "OnInterrupt") ||
+            if (holster ||
+                (NameIs(static_cast<u32>(name), "CommonCleanup") &&
+                 (LiveDword(action + 0x13c) & 1) == 0) ||
+                NameIs(static_cast<u32>(name), "OnInterrupt") ||
                 NameIs(static_cast<u32>(name), "OnCleanup")) {
                 native_cache.fire_pending = false;
             }
@@ -1614,6 +1715,10 @@ void InstallNative() {
         NativeEntry(base + 0xa17f00, reinterpret_cast<u64>(&ObserveFireStart), fire_start_bytes));
     native_timeline_tick = reinterpret_cast<TimelineTick>(
         NativeEntry(base + 0xa28dc0, reinterpret_cast<u64>(&ObserveTimelineTick), event_bytes));
+    auto item_bytes = event_bytes;
+    item_bytes.back() = 0x78;
+    native_timeline_item = reinterpret_cast<OwnerSwitch>(
+        NativeEntry(base + 0xa28850, reinterpret_cast<u64>(&ObserveTimelineItem), item_bytes));
     native_awake = reinterpret_cast<Native>(
         NativeEntry(base + 0x20b8f20, reinterpret_cast<u64>(&ObserveAwake), awake_bytes));
     LOG_INFO(Input, "[DMC TRACE] Native probes before guest execution: held={}, node_clear={}",
@@ -1628,9 +1733,10 @@ void InstallNative() {
     LOG_INFO(Input, "[DMC TRACE] Filtered gate probes: select={}, match={}, condition={}, exit={}",
              native_select_link != nullptr, native_match_event != nullptr,
              native_condition_dispatch != nullptr, native_node_exit != nullptr);
-    LOG_INFO(Input, "[DMC TRACE] Shot timeline probes: start={}, tick={}, awake={}; topology={}",
+    LOG_INFO(Input,
+             "[DMC TRACE] Shot timeline probes: start={}, tick={}, awake={}, item={}; topology={}",
              native_fire_start != nullptr, native_timeline_tick != nullptr, native_awake != nullptr,
-             discover_topology);
+             native_timeline_item != nullptr, discover_topology);
 }
 
 void Install() {
@@ -1649,7 +1755,8 @@ void Install() {
                                        native_node_exit != nullptr, 256, 32, 32, 64});
     PadTrace::Record("DMC_FIRE_HOOK",
                      {native_fire_start != nullptr, native_timeline_tick != nullptr,
-                      native_awake != nullptr, 128, 128, 50, discover_topology});
+                      native_awake != nullptr, 128, 128, 50, discover_topology,
+                      native_timeline_item != nullptr, 64});
     if (original.load() != nullptr || Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;
