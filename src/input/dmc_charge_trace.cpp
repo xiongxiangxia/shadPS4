@@ -310,6 +310,7 @@ struct NativeCache {
     u32 clear_records = 0;
     std::array<u32, 4> aggregate_records{};
     u64 aggregate_request = 0;
+    u64 aggregate_event = 0;
     u32 aggregate_type = 256;
     u32 aggregate_held = 0;
     std::array<u32, 2> handoff_records{};
@@ -455,23 +456,26 @@ void AggregateState(const char* kind, u64 request, void* object, void* event, u3
 
 class AggregateScope {
 public:
-    explicit AggregateScope(u64 request, u32 type = 256, u32 held = 0)
+    explicit AggregateScope(u64 request, u32 type = 256, u32 held = 0, u64 event = 0)
         : previous{native_cache.aggregate_request}, previous_type{native_cache.aggregate_type},
-          previous_held{native_cache.aggregate_held} {
+          previous_held{native_cache.aggregate_held}, previous_event{native_cache.aggregate_event} {
         native_cache.aggregate_request = request;
         native_cache.aggregate_type = type;
         native_cache.aggregate_held = held;
+        native_cache.aggregate_event = event;
     }
     ~AggregateScope() {
         native_cache.aggregate_request = previous;
         native_cache.aggregate_type = previous_type;
         native_cache.aggregate_held = previous_held;
+        native_cache.aggregate_event = previous_event;
     }
 
 private:
     u64 previous;
     u32 previous_type;
     u32 previous_held;
+    u64 previous_event;
 };
 
 bool HandoffBudget(u32 kind) {
@@ -760,7 +764,7 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
     const u64 event_address = reinterpret_cast<u64>(event);
     const u64 descriptor = LiveWord(event_address + 0x60);
     if (descriptor != native_cache.gun_descriptor &&
-        !(native_cache.aggregate_request != 0 && native_cache.aggregate_type == 0 &&
+        !(native_cache.aggregate_event == event_address && native_cache.aggregate_type == 0 &&
           (native_cache.aggregate_held & 8) != 0)) {
         return native_select_link(set, event);
     }
@@ -1049,8 +1053,9 @@ u32 PS4_SYSV_ABI ObserveAggregateEvent(void* object, void* event, u32 input) {
     const auto before = SnapshotBuffer(reinterpret_cast<u64>(object) + 0x78);
     u32 result = 0;
     {
-        const AggregateScope scope{
-            request, type, type != 256 ? LiveDword(reinterpret_cast<u64>(event) + 0xa0) : 0};
+        const AggregateScope scope{request, type,
+                                   type != 256 ? LiveDword(reinterpret_cast<u64>(event) + 0xa0) : 0,
+                                   reinterpret_cast<u64>(event)};
         result = native_aggregate_event(object, event, input);
     }
     AggregateState("DMC_AGG_EVENT_END", request, object, event, input, caller, result);
