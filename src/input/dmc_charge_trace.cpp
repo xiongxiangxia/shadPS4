@@ -6,6 +6,7 @@
 #if defined(ENABLE_PADTRACE) && defined(_WIN64)
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -285,7 +286,42 @@ struct MatchResult {
     bool operator==(const MatchResult&) const = default;
 };
 
+struct GateInput {
+    bool valid = false;
+    u32 combo = 0;
+    u32 flags = 0;
+    u32 type = 0;
+    u32 motion = 0;
+    u32 mode = 0;
+    u32 focus = 0;
+    u32 held = 0;
+    u64 upgrades = 0;
+    bool operator==(const GateInput& other) const {
+        return valid == other.valid && combo == other.combo && flags == other.flags &&
+               type == other.type && mode == other.mode && focus == other.focus &&
+               held == other.held && upgrades == other.upgrades &&
+               (std::bit_cast<float>(motion) > 0) == (std::bit_cast<float>(other.motion) > 0);
+    }
+};
+
+bool IsInputContext(u64 event) {
+    const u64 input_class = Word(guest_base + 0x3b193f8);
+    for (u64 parent = Word(event + 0x50), depth = 0; input_class != 0 && parent != 0 && depth < 16;
+         ++depth) {
+        if (parent == input_class) {
+            return true;
+        }
+        const u64 next = Word(parent + 0x68);
+        if (next == parent) {
+            break;
+        }
+        parent = next;
+    }
+    return false;
+}
+
 struct GateResults {
+    GateInput input{};
     u32 condition_count = 0;
     u32 match_count = 0;
     u32 clipped = 0;
@@ -917,6 +953,28 @@ void GateConditionDetails(u64 request, u64 condition) {
     }
 }
 
+void GateEventDetails(u64 request, u64 definition) {
+    const u64 array = Word(definition + 0x70);
+    const u32 count = LiveDword(definition + 0x78);
+    for (u32 i = 0; array != 0 && i < count && i < 8; ++i) {
+        const u64 condition = Word(array + i * 8);
+        const u64 table = condition != 0 ? Word(condition) : 0;
+        const u64 handler = table != 0 ? Word(table + 0x248) : 0;
+        const u32 kind = handler == guest_base + 0xa232a0   ? 1
+                         : handler == guest_base + 0xb73310 ? 2
+                         : handler == guest_base + 0xa22f70 ? 3
+                                                            : 0;
+        PadTrace::Record("DMC_GATE_EVENT_CONFIG",
+                         {static_cast<s64>(request), static_cast<s64>(definition), i,
+                          static_cast<s64>(condition), static_cast<s64>(handler), kind,
+                          kind != 0 ? static_cast<s64>(Word(condition + 0x60)) : 0,
+                          kind == 2 ? LiveDword(condition + 0x68) : 0,
+                          kind == 2 ? static_cast<s64>(Word(condition + 0x70)) : 0,
+                          kind == 2 ? LiveDword(condition + 0x78) : 0, count, count > 8});
+        Identity(request, condition);
+    }
+}
+
 void GateRelations(u64 request, u64 set, u64 link, u32 kind, u64 container) {
     if (container == 0) {
         return;
@@ -1087,6 +1145,18 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
     }
     const u32 type = *reinterpret_cast<const u8*>(event_address + 0x78);
     GateTrace trace{descriptor};
+    auto& input = trace.results.input;
+    input.valid = IsInputContext(event_address);
+    if (input.valid) {
+        input.combo = LiveDword(event_address + 0x68);
+        input.flags = LiveDword(event_address + 0x6c);
+        input.type = type;
+        input.motion = LiveDword(event_address + 0x7c);
+        input.mode = *reinterpret_cast<const u8*>(event_address + 0x90);
+        input.focus = *reinterpret_cast<const u8*>(event_address + 0x91);
+        input.held = LiveDword(event_address + 0xa0);
+        input.upgrades = LiveWord(event_address + 0x70);
+    }
     auto* previous = active_gate;
     active_gate = &trace;
     void* selected = native_select_link(set, event);
@@ -1128,6 +1198,9 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
                       trace.results.clipped, native_cache.gun_epoch,
                       static_cast<s64>(native_cache.aggregate_request),
                       reinterpret_cast<s64>(__builtin_return_address(0))});
+    PadTrace::Record("DMC_GATE_INPUT", {static_cast<s64>(request), input.valid, input.combo,
+                                        input.flags, input.type, input.motion, input.mode,
+                                        input.focus, input.held, static_cast<s64>(input.upgrades)});
     if (discover_topology) {
         GateTopology(request, address, descriptor);
     }
@@ -1152,6 +1225,7 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
         const auto& match = trace.results.matches[i];
         PadTrace::Record("DMC_GATE_MATCH", {static_cast<s64>(request), i,
                                             static_cast<s64>(match.definition), match.result});
+        GateEventDetails(request, match.definition);
     }
     if (native_cache.gate_records == 256) {
         PadTrace::Record("DMC_NATIVE_LIMIT", {11, 256});

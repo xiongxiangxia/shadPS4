@@ -71,6 +71,8 @@ def summarize(path):
     gate_selections = []
     gate_conditions = []
     gate_matches = []
+    gate_inputs = []
+    gate_event_configs = []
     gate_metadata = []
     node_exits = []
     fire_hooks = []
@@ -217,6 +219,21 @@ def summarize(path):
                     "descriptor": hex(p[2]), "type": p[3], "selected_link": hex(p[4]),
                     "condition_count": p[5], "match_count": p[6], "clipped_raw": p[7],
                     "gun_epoch": p[8], "parent": p[9], "caller": hex(p[10]),
+                })
+            elif kind == "DMC_GATE_INPUT" and len(gate_inputs) < 256:
+                gate_inputs.append({
+                    "monotonic_us": timestamp, "request": p[0], "input_class_matched": bool(p[1]),
+                    "combo_window": p[2], "event_flags_raw": p[3], "input_type": p[4],
+                    "motion": float_word(p[5]), "play_mode": p[6], "focus_attack_type": p[7],
+                    "held_mask": p[8], "upgrades": hex(p[9]),
+                })
+            elif kind == "DMC_GATE_EVENT_CONFIG" and len(gate_event_configs) < 8192:
+                gate_event_configs.append({
+                    "request": p[0], "definition": hex(p[1]), "index": p[2],
+                    "condition": hex(p[3]), "handler": hex(p[4]), "kind_raw": p[5],
+                    "packed_config_raw": p[6], "buttons_mask": p[7],
+                    "buttons_array": hex(p[8]), "buttons_count": p[9],
+                    "definition_condition_count": p[10], "clipped": bool(p[11]),
                 })
             elif kind == "DMC_GATE_CONDITION" and len(gate_conditions) < 8192:
                 gate_conditions.append({
@@ -432,6 +449,8 @@ def summarize(path):
         "dmc_gate_selections_first_256": gate_selections,
         "dmc_gate_conditions_first_8192": gate_conditions,
         "dmc_gate_matches_first_8192": gate_matches,
+        "dmc_gate_inputs_first_256": gate_inputs,
+        "dmc_gate_event_configs_first_8192": gate_event_configs,
         "dmc_gate_metadata_first_4096": gate_metadata,
         "dmc_node_exits_first_64": node_exits,
         "dmc_fire_hooks": fire_hooks,

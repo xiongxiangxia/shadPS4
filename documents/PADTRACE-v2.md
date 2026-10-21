@@ -453,6 +453,8 @@ validated native evaluation sites, not every nested expression/native event-cond
 | DMC_GATE_SELECT | request, set, descriptor, input type, selected link (0 rejected), condition count, match count, clipping bits (1 conditions, 2 matches), gun-hold epoch, aggregate parent, caller |
 | DMC_GATE_CONDITION | request, index, condition object, function, context, pawn, returned bool word, caller, function flags raw |
 | DMC_GATE_MATCH | request, index, event definition, returned bool word |
+| DMC_GATE_INPUT | selection request, validated input-context class, input combo-window index, event flags raw, input event type, motion float bits, cached play mode byte, cached focus-attack byte, held-button mask, upgrades pointer |
+| DMC_GATE_EVENT_CONFIG | selection request, event definition, declared condition index, condition object, native virtual slot 0x248, known kind (0 unknown, 1 NT common, 2 DV common, 3 combo window), packed configuration at +0x60, DV held-button mask at +0x68, DV button-list array/count, total declared conditions, metadata clipped at 8 |
 | DMC_GATE_TOPOLOGY | request, set, descriptor, total links, links clipped |
 | DMC_GATE_LINK | request, set, link, event definition, target node, graph, script-condition container |
 | DMC_GATE_RELATION_SET | request, set, link (0 common), kind (0 common script, 1 event match, 2 link script), container, total conditions, conditions clipped |
@@ -465,6 +467,21 @@ DMC_NODE_EXIT shares before/after DMC_BUFFER and DMC_BUFFER_ITEM records. Token 
 describe configuration, not separately measured presence. Topology is discovered once per
 set/descriptor pair per capture. Native limit kinds 11/12/13 indicate gate emissions,
 node exits, or gate-key cache exhaustion. DMC_GATE_TOPOLOGY_LIMIT reports topology capacity.
+
+The input-context snapshot is taken before the original selector. Its fields also enter
+the existing change-detection cache, so a changed combo window or cached combat context
+is not suppressed merely because the aggregate match result remains false. Snapshots
+remain bounded by the existing 256-selection budget. No original predicate is re-evaluated.
+Motion retains its raw float bits in emitted snapshots, but change detection compares
+only `motion > 0`, matching the known native common predicate and avoiding analog noise.
+
+Event-configuration records describe up to eight declared native conditions per observed
+event match, emitted after the selector. They do NOT establish that every listed condition
+executed: the game short-circuits on the first rejection. Only DMC_GATE_MATCH is the actual
+aggregate return. Common/ComboWindow configuration can help interpret that return, but
+unknown handlers and upgrade conditions require their own evidence. These fields address
+the authored difference between the local shotgun-charge entry (Held plus combo window)
+and the root charge entry (Held plus cached combat context and upgrade checks).
 
 `python padtrace_summary.py padtrace-v2-SESSION.csv --output summary.json`
 
