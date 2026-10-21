@@ -346,6 +346,19 @@ struct GateSample {
 
 thread_local GateTrace* active_gate = nullptr;
 
+struct BufferAdmission {
+    u64 event = 0;
+    u64 definition = 0;
+    u64 caller = 0;
+    u32 matches = 0;
+    u32 combo = 0;
+    u32 mode = 0;
+    u32 focus = 0;
+    u32 held = 0;
+};
+
+thread_local BufferAdmission* active_admission = nullptr;
+
 struct NativeCache {
     u64 generation = 0;
     u32 held_records = 0;
@@ -1114,6 +1127,17 @@ void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* p
 
 u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
     auto* trace = active_gate;
+    auto* admission = active_admission;
+    if (admission != nullptr && admission->event == reinterpret_cast<u64>(event) &&
+        definition != nullptr) {
+        const u32 result = native_match_event(definition, event);
+        ++admission->matches;
+        if (result != 0 && admission->definition == 0) {
+            admission->definition = reinterpret_cast<u64>(definition);
+            admission->caller = reinterpret_cast<u64>(__builtin_return_address(0));
+        }
+        return result;
+    }
     if (trace == nullptr || definition == nullptr ||
         LiveWord(reinterpret_cast<u64>(definition) + 0x68) != trace->descriptor) {
         return native_match_event(definition, event);
@@ -1275,7 +1299,19 @@ u32 PS4_SYSV_ABI ObserveBufferEvent(void* buffer, void* owner, void* event, void
         return native_buffer_event(buffer, owner, event, first, second);
     }
     const auto before = SnapshotBuffer(reinterpret_cast<u64>(buffer));
+    BufferAdmission admission{};
+    auto* previous_admission = active_admission;
+    if (event != nullptr && native_cache.aggregate_type == 2 &&
+        LiveWord(reinterpret_cast<u64>(event) + 0x60) == native_cache.gun_descriptor) {
+        admission.event = reinterpret_cast<u64>(event);
+        admission.combo = LiveDword(admission.event + 0x68);
+        admission.mode = *reinterpret_cast<const u8*>(admission.event + 0x90);
+        admission.focus = *reinterpret_cast<const u8*>(admission.event + 0x91);
+        admission.held = LiveDword(admission.event + 0xa0);
+    }
+    active_admission = admission.event != 0 ? &admission : nullptr;
     const u32 result = native_buffer_event(buffer, owner, event, first, second);
+    active_admission = previous_admission;
     const auto after = SnapshotBuffer(reinterpret_cast<u64>(buffer));
     if (before == after || !HandoffBudget(0)) {
         return result;
@@ -1287,6 +1323,17 @@ u32 PS4_SYSV_ABI ObserveBufferEvent(void* buffer, void* owner, void* event, void
                       reinterpret_cast<s64>(event), reinterpret_cast<s64>(first),
                       reinterpret_cast<s64>(second),
                       reinterpret_cast<s64>(__builtin_return_address(0))});
+    if (admission.event != 0) {
+        PadTrace::Record("DMC_BUFFER_ADMIT",
+                         {static_cast<s64>(request), static_cast<s64>(admission.event), result,
+                          static_cast<s64>(admission.definition),
+                          static_cast<s64>(admission.caller), admission.matches, admission.combo,
+                          admission.mode, admission.focus, admission.held});
+        if (admission.definition != 0) {
+            GateEventDetails(request, admission.definition);
+            Identity(request, admission.definition);
+        }
+    }
     BufferState(request, 0, before);
     Identity(request, reinterpret_cast<u64>(owner));
     BufferState(request, 1, after);

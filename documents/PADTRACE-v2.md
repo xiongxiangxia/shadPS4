@@ -453,6 +453,7 @@ validated native evaluation sites, not every nested expression/native event-cond
 | DMC_GATE_SELECT | request, set, descriptor, input type, selected link (0 rejected), condition count, match count, clipping bits (1 conditions, 2 matches), gun-hold epoch, aggregate parent, caller |
 | DMC_GATE_CONDITION | request, index, condition object, function, context, pawn, returned bool word, caller, function flags raw |
 | DMC_GATE_MATCH | request, index, event definition, returned bool word |
+| DMC_BUFFER_ADMIT | buffer-call request, incoming event, buffer return value, first successfully matched event definition (0 if none observed), matcher caller, matcher call count, combo window, cached play mode, cached focus-attack type, held-button mask |
 | DMC_GATE_INPUT | selection request, validated input-context class, input combo-window index, event flags raw, input event type, motion float bits, cached play mode byte, cached focus-attack byte, held-button mask, upgrades pointer |
 | DMC_GATE_EVENT_CONFIG | selection request, event definition, declared condition index, condition object, native virtual slot 0x248, known kind (0 unknown, 1 NT common, 2 DV common, 3 combo window), packed configuration at +0x60, DV held-button mask at +0x68, DV button-list array/count, total declared conditions, metadata clipped at 8 |
 | DMC_GATE_TOPOLOGY | request, set, descriptor, total links, links clipped |
@@ -482,6 +483,18 @@ aggregate return. Common/ComboWindow configuration can help interpret that retur
 unknown handlers and upgrade conditions require their own evidence. These fields address
 the authored difference between the local shotgun-charge entry (Held plus combo window)
 and the root charge entry (Held plus cached combat context and upgrade checks).
+
+Buffer admission is a separate path from actual transition selection. It can accept an
+event without running every candidate link's action conditions. DMC_BUFFER_ADMIT observes
+the existing match hook only inside a held-gun buffer call and records the first actual
+successful event-definition match, not a selected link or a started action. The validated
+callers at relative 0xa1c5d8/0xa1c678 identify the first/second supplied transition set.
+Admission records share the existing changed-buffer emission rule and 256-call budget;
+input fields are snapshotted before the buffer call, and match results are observed inside it.
+unchanged buffer calls are not individually reported. A nonzero buffer return with no
+observed match must not be assigned a guessed accepting definition. Configuration for
+the successful definition uses DMC_GATE_EVENT_CONFIG keyed by the buffer-call request.
+No predicate is re-evaluated, and no additional native detour is installed.
 
 `python padtrace_summary.py padtrace-v2-SESSION.csv --output summary.json`
 

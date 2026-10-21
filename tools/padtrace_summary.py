@@ -73,6 +73,7 @@ def summarize(path):
     gate_matches = []
     gate_inputs = []
     gate_event_configs = []
+    buffer_admissions = []
     gate_metadata = []
     node_exits = []
     fire_hooks = []
@@ -219,6 +220,14 @@ def summarize(path):
                     "descriptor": hex(p[2]), "type": p[3], "selected_link": hex(p[4]),
                     "condition_count": p[5], "match_count": p[6], "clipped_raw": p[7],
                     "gun_epoch": p[8], "parent": p[9], "caller": hex(p[10]),
+                })
+            elif kind == "DMC_BUFFER_ADMIT" and len(buffer_admissions) < 256:
+                buffer_admissions.append({
+                    "monotonic_us": timestamp, "request": p[0], "event": hex(p[1]),
+                    "buffer_result": p[2], "first_matching_definition": hex(p[3]),
+                    "match_caller": hex(p[4]), "match_calls": p[5],
+                    "combo_window": p[6], "play_mode": p[7],
+                    "focus_attack_type": p[8], "held_mask": p[9],
                 })
             elif kind == "DMC_GATE_INPUT" and len(gate_inputs) < 256:
                 gate_inputs.append({
@@ -451,6 +460,7 @@ def summarize(path):
         "dmc_gate_matches_first_8192": gate_matches,
         "dmc_gate_inputs_first_256": gate_inputs,
         "dmc_gate_event_configs_first_8192": gate_event_configs,
+        "dmc_buffer_admissions_first_256": buffer_admissions,
         "dmc_gate_metadata_first_4096": gate_metadata,
         "dmc_node_exits_first_64": node_exits,
         "dmc_fire_hooks": fire_hooks,
