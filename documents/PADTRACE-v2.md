@@ -398,7 +398,8 @@ The DMC_FIRE_HOOK record includes this setting. No additional user test sequence
 | DMC_FIRE_HOOK | action-start, timeline-tick, awake installed; event budget, tick budget per shot, sample interval ms, topology enabled, item-dispatch installed, item budget per shot |
 | DMC_FIRE_SCHEDULE | request, shot serial, action, node, timeline, callback object, packed callback FName, relative seconds bits, is HolsterWeapon, index, total, params, aggregate parent, timeline time before/after start bits, scheduled flags byte, inventory clipped, item kind byte, command pointer, token raw, condition pointer, repeat count raw, repeat interval bits |
 | DMC_FIRE_START / DMC_FIRE_CALLBACK_BEGIN / DMC_FIRE_CALLBACK_END / DMC_FIRE_AWAKE_BEGIN / DMC_FIRE_AWAKE_END | request, shot serial, action, node, timeline, timeline time bits, node state, node flags, buffer count, buffer owner, script FName, action flags raw, action run-time bits |
-| DMC_FIRE_TICK | shot serial, timeline, delta bits, timeline time before/after tick bits, callback still pending, remaining scheduled items |
+| DMC_FIRE_TICK | shot serial, timeline, delta bits, timeline time before/after tick bits, callback still pending, remaining scheduled items, immediate caller, cached world before, readable before, four world words before, readable after, four world words after, tracked tick sequence, last observed input request, cached world after |
+| DMC_TIMELINE_STACK | shot serial, count, up to six frame-chain return addresses within eboot code |
 | DMC_FIRE_ITEM_BEGIN | request, shot serial, timeline, item address, timeline time bits, callback object, callback FName, command pointer, token raw, argument raw, condition pointer, relative time bits, repeat count raw, repeat interval bits, item kind byte, flags byte, aggregate parent, active tick delta bits |
 | DMC_FIRE_ITEM_END | same fields as DMC_FIRE_START, sharing the item-dispatch request |
 | DMC_FIRE_AWAKE_ORIGIN | awake request, shot serial, executing function, function outer, FFrame context object, bytecode position, active item request (0 outside tracked dispatch), aggregate parent, active tick delta bits |
@@ -430,10 +431,28 @@ The regular frame and pad probes remain available to assess timing interference.
 
 This remains diagnosis, not a charge fix. Game files and input semantics are unchanged.
 Use the diagnostic executable, not baseline. Capture one F9 segment containing
-**success -> failure -> success**, keeping the gun held long enough in every attempt.
+**success -> failure -> trigger-release recovery**, keeping the gun held long enough in every attempt.
 For failure, melee near the end of the initial shot; for success, delay melee. Release
-all controls between attempts. Stop F9 and exit normally. No extra weapon/controller
+all controls between attempts. For recovery, keep the gun held while using a trigger weapon,
+then release only the trigger and observe whether charge begins. Stop F9 and exit normally. No extra weapon/controller
 matrix is required unless requested. Use shotgun or dual pistols, not the explosive gun.
+
+Clock/caller correlation adds no new hooks or per-frame output. Each tracked pending tick
+reads four cached world words before execution; after execution they are read only when
+the existing 50 ms/end sample is emitted. The 128-sample per-shot budget is unchanged.
+One bounded frame-chain walk per shot records the timeline caller chain; it may be partial
+when frame pointers are unavailable. The immediate caller is recorded independently.
+World +0x690 is the verified input world-time float; the next three words are raw and their
+meaning is not established. The world pointer is refreshed only by existing GameClock probes;
+readability is explicit and does not guarantee that a cached world remains the active world.
+
+DMC_AGG_CONTEXT appends cached world, readable, four world words, tracked tick sequence and
+shot serial at p10..p17. The analyzer retains 4096 contexts plus the legacy first-100 view.
+Tick sequence, shot serial and last observed input request are thread-local correlations,
+not complete input-frame identifiers. A tick on another thread may not be tracked at all.
+Compare thread identifiers as well as serials. Legacy rows have zero extension fields and
+cannot establish clock/caller correlations. Hook boundary snapshots and wall times include
+instrumentation overhead; they do not establish an emulator fault on their own.
 
 The new probes filter transition searches to the tracked held-gun descriptor and pressed
 inputs delivered while the gun is held. They collect event-match outcomes and actual

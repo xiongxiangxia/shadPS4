@@ -386,10 +386,14 @@ struct NativeCache {
     u32 fire_serial = 0;
     u32 fire_records = 0;
     u32 timeline_records = 0;
+    u32 timeline_calls = 0;
     u32 item_records = 0;
+    u64 world = 0;
+    u64 last_input_request = 0;
     u64 timeline_item_request = 0;
     u32 timeline_delta = 0;
     bool fire_pending = false;
+    bool timeline_stack_written = false;
     std::chrono::steady_clock::time_point timeline_recorded{};
     std::array<GateSample, 128> gates{};
     std::array<std::array<u64, 2>, 64> topologies{};
@@ -398,6 +402,22 @@ struct NativeCache {
 };
 
 thread_local NativeCache native_cache;
+
+void OwnerStack(u64 request, u64 frame, const char* kind = "DMC_OWNER_STACK");
+
+struct WorldSnapshot {
+    u64 world = 0;
+    bool readable = false;
+    std::array<u32, 4> times{};
+};
+
+WorldSnapshot SnapshotWorld() {
+    WorldSnapshot snapshot;
+    snapshot.world = native_cache.world;
+    snapshot.readable = snapshot.world != 0 &&
+                        Read(snapshot.world + 0x690, snapshot.times.data(), sizeof(snapshot.times));
+    return snapshot;
+}
 
 void ResetNativeCache() {
     const u64 generation = capture_generation.load(std::memory_order_relaxed);
@@ -412,6 +432,7 @@ void GameClock(u64 request, u64 input = 0, u32 button = 0) {
     const u64 contexts = engine != 0 ? Word(engine + 0x80) : 0;
     const u64 current = contexts != 0 ? Word(contexts + 0x60) : 0;
     const u64 world = current != 0 ? Word(current) : 0;
+    native_cache.world = world;
     std::array<u32, 4> times{};
     const bool readable = world != 0 && Read(world + 0x690, times.data(), sizeof(times));
     PadTrace::Record("DMC_GAME_CLOCK",
@@ -788,6 +809,8 @@ void PS4_SYSV_ABI ObserveFireStart(void* action) {
     native_cache.holster_name = holster;
     native_cache.fire_pending = true;
     native_cache.timeline_records = 0;
+    native_cache.timeline_calls = 0;
+    native_cache.timeline_stack_written = false;
     native_cache.item_records = 0;
     native_cache.timeline_recorded = {};
     ++native_cache.fire_serial;
@@ -845,6 +868,14 @@ void PS4_SYSV_ABI ObserveTimelineTick(void* object, float delta) {
     }
     const u32 before = LiveDword(address + 0x8c);
     const u32 serial = native_cache.fire_serial;
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    const auto world_before = SnapshotWorld();
+    const u32 sequence = ++native_cache.timeline_calls;
+    const u64 last_input = native_cache.last_input_request;
+    if (!native_cache.timeline_stack_written) {
+        native_cache.timeline_stack_written = true;
+        OwnerStack(serial, reinterpret_cast<u64>(__builtin_frame_address(0)), "DMC_TIMELINE_STACK");
+    }
     const u32 previous_delta = native_cache.timeline_delta;
     native_cache.timeline_delta = FloatWord(delta);
     native_timeline_tick(object, delta);
@@ -854,9 +885,29 @@ void PS4_SYSV_ABI ObserveTimelineTick(void* object, float delta) {
         now - native_cache.timeline_recorded >= std::chrono::milliseconds{50}) {
         ++native_cache.timeline_records;
         native_cache.timeline_recorded = now;
-        PadTrace::Record("DMC_FIRE_TICK", {serial, static_cast<s64>(address), FloatWord(delta),
-                                           before, LiveDword(address + 0x8c),
-                                           native_cache.fire_pending, LiveDword(address + 0x98)});
+        const auto world_after = SnapshotWorld();
+        PadTrace::Record("DMC_FIRE_TICK", {serial,
+                                           static_cast<s64>(address),
+                                           FloatWord(delta),
+                                           before,
+                                           LiveDword(address + 0x8c),
+                                           native_cache.fire_pending,
+                                           LiveDword(address + 0x98),
+                                           static_cast<s64>(caller),
+                                           static_cast<s64>(world_before.world),
+                                           world_before.readable,
+                                           world_before.times[0],
+                                           world_before.times[1],
+                                           world_before.times[2],
+                                           world_before.times[3],
+                                           world_after.readable,
+                                           world_after.times[0],
+                                           world_after.times[1],
+                                           world_after.times[2],
+                                           world_after.times[3],
+                                           sequence,
+                                           static_cast<s64>(last_input),
+                                           static_cast<s64>(world_after.world)});
         if (native_cache.timeline_records == 128) {
             PadTrace::Record("DMC_NATIVE_LIMIT", {15, 128, serial});
         }
@@ -1381,7 +1432,7 @@ u32 PS4_SYSV_ABI ObserveGraphEvent(void* graph, void* event) {
     return result;
 }
 
-void OwnerStack(u64 request, u64 frame) {
+void OwnerStack(u64 request, u64 frame, const char* kind) {
     std::array<u64, 6> callers{};
     u32 count = 0;
     for (; count < callers.size() && frame != 0; ++count) {
@@ -1397,11 +1448,10 @@ void OwnerStack(u64 request, u64 frame) {
         }
         frame = words[0];
     }
-    PadTrace::Record("DMC_OWNER_STACK",
-                     {static_cast<s64>(request), count, static_cast<s64>(callers[0]),
-                      static_cast<s64>(callers[1]), static_cast<s64>(callers[2]),
-                      static_cast<s64>(callers[3]), static_cast<s64>(callers[4]),
-                      static_cast<s64>(callers[5])});
+    PadTrace::Record(kind, {static_cast<s64>(request), count, static_cast<s64>(callers[0]),
+                            static_cast<s64>(callers[1]), static_cast<s64>(callers[2]),
+                            static_cast<s64>(callers[3]), static_cast<s64>(callers[4]),
+                            static_cast<s64>(callers[5])});
 }
 
 void ObserveOwnerSwitch(void* object, void* incoming, u32 kind, u64 caller, u64 frame) {
@@ -1477,12 +1527,18 @@ u32 AggregateContext(u64 request, void* event) {
     if (input && type == 2 && held == 8 && native_cache.gun_descriptor == 0) {
         native_cache.gun_descriptor = LiveWord(address + 0x60);
     }
-    PadTrace::Record("DMC_AGG_CONTEXT",
-                     {static_cast<s64>(request), static_cast<s64>(address),
-                      static_cast<s64>(event_class), input, type, held,
-                      static_cast<s64>(LiveWord(address + 0x60)),
-                      static_cast<s64>(LiveWord(address + 0x68)),
-                      static_cast<s64>(LiveWord(address + 0x70)), static_cast<s64>(input_class)});
+    if (input) {
+        native_cache.last_input_request = request;
+    }
+    const auto world = SnapshotWorld();
+    PadTrace::Record(
+        "DMC_AGG_CONTEXT",
+        {static_cast<s64>(request), static_cast<s64>(address), static_cast<s64>(event_class), input,
+         type, held, static_cast<s64>(LiveWord(address + 0x60)),
+         static_cast<s64>(LiveWord(address + 0x68)), static_cast<s64>(LiveWord(address + 0x70)),
+         static_cast<s64>(input_class), static_cast<s64>(world.world), world.readable,
+         world.times[0], world.times[1], world.times[2], world.times[3],
+         native_cache.timeline_calls, native_cache.fire_serial});
     return input ? type : 256;
 }
 

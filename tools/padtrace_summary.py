@@ -80,6 +80,7 @@ def summarize(path):
     fire_schedules = []
     fire_states = []
     fire_ticks = []
+    timeline_stacks = []
     fire_items = []
     fire_origins = []
     fire_commands = []
@@ -184,10 +185,24 @@ def summarize(path):
                 })
             elif kind == "DMC_FIRE_TICK" and len(fire_ticks) < 512:
                 fire_ticks.append({
-                    "monotonic_us": timestamp, "serial": p[0], "timeline": hex(p[1]),
+                    "monotonic_us": timestamp, "thread": row["thread"],
+                    "serial": p[0], "timeline": hex(p[1]),
                     "delta_s": float_word(p[2]),
                     "timeline_before_after_s": [float_word(p[3]), float_word(p[4])],
                     "pending": bool(p[5]), "remaining_items": p[6],
+                    "caller": hex(p[7]), "cached_world": hex(p[8]),
+                    "world_readable_before_after": [bool(p[9]), bool(p[14])],
+                    "world_time_before_after_s": [
+                        float_word(p[10]) if p[9] else None,
+                        float_word(p[15]) if p[14] else None],
+                    "adjacent_world_words_before_after_raw": [p[11:14], p[16:19]],
+                    "tracked_tick_sequence": p[19], "last_observed_input_request": p[20],
+                    "cached_world_after": hex(p[21]),
+                })
+            elif kind == "DMC_TIMELINE_STACK" and len(timeline_stacks) < 128:
+                timeline_stacks.append({
+                    "monotonic_us": timestamp, "thread": row["thread"], "serial": p[0],
+                    "callers": [hex(v) for v in p[2:2 + min(max(p[1], 0), 6)]],
                 })
             elif kind == "DMC_FIRE_ITEM_BEGIN" and len(fire_items) < 512:
                 fire_items.append({
@@ -324,11 +339,16 @@ def summarize(path):
             elif kind in ("DMC_AGG_EVENT_BEGIN", "DMC_AGG_CLEAR_BEGIN", "DMC_AGG_FLUSH_BEGIN"):
                 aggregate_pending[p[0]] = (timestamp, kind, p)
             elif kind == "DMC_AGG_CONTEXT":
-                if len(aggregate_contexts) < 100:
+                if len(aggregate_contexts) < 4096:
                     aggregate_contexts.append({
+                        "monotonic_us": timestamp, "thread": row["thread"],
                         "request": p[0], "event": hex(p[1]), "class": hex(p[2]),
                         "input_class_matches": bool(p[3]), "type_raw": p[4],
                         "held_mask_raw": hex(p[5]), "event_words_raw": [hex(v) for v in p[6:9]],
+                        "cached_world": hex(p[10]), "world_readable": bool(p[11]),
+                        "world_time_s": float_word(p[12]) if p[11] else None,
+                        "adjacent_world_words_raw": p[13:16],
+                        "tracked_tick_sequence": p[16], "serial": p[17],
                     })
             elif kind in ("DMC_AGG_EVENT_END", "DMC_AGG_CLEAR_END", "DMC_AGG_FLUSH_END"):
                 began = aggregate_pending.pop(p[0], None)
@@ -448,7 +468,8 @@ def summarize(path):
         "read_state_callers": dict(read_callers),
         "dmc_assignment_count": dmc_total,
         "dmc_aggregate_calls_first_100": aggregate_calls,
-        "dmc_aggregate_contexts_first_100": aggregate_contexts,
+        "dmc_aggregate_contexts_first_100": aggregate_contexts[:100],
+        "dmc_aggregate_contexts_first_4096": aggregate_contexts,
         "dmc_objects": objects,
         "dmc_handoff_sparse": handoff_sparse,
         "dmc_owner_switches": owner_switches,
@@ -469,6 +490,7 @@ def summarize(path):
         "dmc_fire_states_first_1024": fire_states,
         "dmc_fire_ticks_first_128": fire_ticks[:128],
         "dmc_fire_ticks_first_512": fire_ticks,
+        "dmc_timeline_stacks_first_128": timeline_stacks,
         "dmc_fire_items_first_512": fire_items,
         "dmc_fire_origins_first_128": fire_origins,
         "dmc_fire_commands_first_128": fire_commands,
