@@ -515,6 +515,32 @@ observed match must not be assigned a guessed accepting definition. Configuratio
 the successful definition uses DMC_GATE_EVENT_CONFIG keyed by the buffer-call request.
 No predicate is re-evaluated, and no additional native detour is installed.
 
+### Bounded RangedDenied ownership snapshots
+
+DMC_RANGED_TOKEN is emitted only alongside an already-sampled gate condition matching the
+known native token predicate and the RangedDenied FName. It uses the existing selector hook;
+there is no new detour, global token stream or per-frame output. At most 128 snapshots per
+capture, 16 hash-chain links per lookup and eight owner FNames per snapshot are read.
+Native limit 17 reports snapshot budget exhaustion. All lookup reads are guarded.
+
+| kind | p0 onwards, in order |
+| --- | --- |
+| DMC_RANGED_TOKEN | selector request, condition, context, context pawn, token manager, packed token FName, context query handler, status, map record, counter raw, owner count, owner capacity, sampled owner count, flags, eight packed owner FNames, hash links followed, gun epoch |
+
+Status: 1 matched record (including a zero counter), 2 no matching record, 3 unreadable,
+4 unsupported handler/layout, 5 chain bound reached, 6 missing pawn/manager. Only status 1
+with no relevant clipping/read-failure flag supplies a complete owner list. Flags: bit0
+owner list truncated, bit1 owner read failed. Raw counters are not inferred from conditions.
+The context query handler must match the validated DVActionGraph_Context implementation;
+an override produces unsupported status rather than an invented negative result.
+
+The snapshots are taken after the selector returns, not inside the original token query.
+They do not capture every token mutation or establish creation/deletion pairing. Unchanged
+gate results remain deduplicated; owner-only changes between sampled gates may be missed.
+Owner names are FNames supplied by the game, not guaranteed unique action-object pointers.
+The analyzer preserves their instance numbers, raw values, validity status and clipping.
+This is a read-only diagnostic, not a token-clear or charge fix. Test sequence is unchanged.
+
 `python padtrace_summary.py padtrace-v2-SESSION.csv --output summary.json`
 
 The standard-library-only helper reports sample age, API read gaps per thread/handle, queue

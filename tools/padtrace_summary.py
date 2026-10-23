@@ -75,6 +75,7 @@ def summarize(path):
     gate_event_configs = []
     buffer_admissions = []
     gate_metadata = []
+    ranged_tokens = []
     node_exits = []
     fire_hooks = []
     fire_schedules = []
@@ -264,6 +265,17 @@ def summarize(path):
                     "request": p[0], "index": p[1], "condition": hex(p[2]),
                     "function": hex(p[3]), "context": hex(p[4]), "pawn": hex(p[5]),
                     "result": p[6], "caller": hex(p[7]), "function_flags_raw": p[8],
+                })
+            elif kind == "DMC_RANGED_TOKEN" and len(ranged_tokens) < 128:
+                ranged_tokens.append({
+                    "monotonic_us": timestamp, "thread": row["thread"],
+                    "request": p[0], "condition": hex(p[1]), "context": hex(p[2]),
+                    "context_pawn": hex(p[3]), "manager": hex(p[4]), "token_name_raw": p[5],
+                    "query_handler": hex(p[6]), "status_raw": p[7], "record": hex(p[8]),
+                    "counter_raw": p[9], "owner_count": p[10], "owner_capacity": p[11],
+                    "sampled_owners": p[12], "flags_raw": p[13],
+                    "owner_names_raw": p[14:14 + min(max(p[12], 0), 8)],
+                    "hash_links_followed": p[22], "gun_epoch": p[23],
                 })
             elif kind == "DMC_GATE_MATCH" and len(gate_matches) < 8192:
                 gate_matches.append({"request": p[0], "index": p[1],
@@ -459,6 +471,11 @@ def summarize(path):
         item["callback_name"] = names.get(item["callback_name_raw"] & 0xffffffff)
     for item in fire_states:
         item["script_name"] = names.get(item["script_name_raw"] & 0xffffffff)
+    for item in ranged_tokens:
+        item["token_name"] = names.get(item["token_name_raw"] & 0xffffffff)
+        item["owners"] = [
+            {"name": names.get(value & 0xffffffff), "number_raw": (value >> 32) & 0xffffffff}
+            for value in item["owner_names_raw"]]
 
     return {
         "revision": revision,
@@ -483,6 +500,7 @@ def summarize(path):
         "dmc_gate_event_configs_first_8192": gate_event_configs,
         "dmc_buffer_admissions_first_256": buffer_admissions,
         "dmc_gate_metadata_first_4096": gate_metadata,
+        "dmc_ranged_token_snapshots_first_128": ranged_tokens,
         "dmc_node_exits_first_64": node_exits,
         "dmc_fire_hooks": fire_hooks,
         "dmc_fire_schedules_first_2048": fire_schedules,

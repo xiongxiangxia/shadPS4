@@ -4,6 +4,7 @@
 #include "input/dmc_charge_trace.h"
 
 #if defined(ENABLE_PADTRACE) && defined(_WIN64)
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -375,6 +376,8 @@ struct NativeCache {
     u32 owner_records = 0;
     u32 exit_records = 0;
     u32 gate_records = 0;
+    u32 token_records = 0;
+    u64 ranged_denied_name = 0;
     u32 gun_since = 0;
     u32 gun_epoch = 0;
     u64 gun_descriptor = 0;
@@ -742,6 +745,137 @@ bool NameIs(u32 index, const char* expected) {
         }
     }
     return true;
+}
+
+void RangedTokenState(u64 request, const ConditionResult& condition) {
+    if (native_cache.token_records >= 128) {
+        return;
+    }
+    const u64 condition_table = Word(condition.object);
+    if (condition_table == 0 || Word(condition_table + 0x250) != guest_base + 0xb72300) {
+        return;
+    }
+    const u64 token = Word(condition.object + 0x60);
+    if (native_cache.ranged_denied_name == 0 && NameIs(static_cast<u32>(token), "RangedDenied")) {
+        native_cache.ranged_denied_name = token;
+    }
+    if (token == 0 || token != native_cache.ranged_denied_name) {
+        return;
+    }
+    u64 handler = 0;
+    u64 pawn = 0;
+    u64 manager = 0;
+    u64 record = 0;
+    u32 count = 0;
+    u32 owner_count = 0;
+    u32 owner_capacity = 0;
+    u32 sampled = 0;
+    u32 flags = 0;
+    u32 steps = 0;
+    std::array<u64, 8> owners{};
+    const auto status = [&]() -> u32 {
+        u64 table = 0;
+        if (!Read(condition.context, &table, sizeof(table)) || table == 0 ||
+            !Read(table + 0x2e8, &handler, sizeof(handler))) {
+            return 3;
+        }
+        if (handler != guest_base + 0xb73b50) {
+            return 4;
+        }
+        if (!Read(condition.context + 0x90, &pawn, sizeof(pawn))) {
+            return 3;
+        }
+        if (pawn == 0) {
+            return 6;
+        }
+        if (!Read(pawn + 0x9c0, &manager, sizeof(manager))) {
+            return 3;
+        }
+        if (manager == 0) {
+            return 6;
+        }
+        std::array<u64, 10> header{};
+        if (!Read(manager + 0x60, header.data(), sizeof(header))) {
+            return 3;
+        }
+        const u32 buckets = static_cast<u32>(header[9]);
+        if (buckets == 0) {
+            return 2;
+        }
+        if (buckets > 65536 || (buckets & (buckets - 1)) != 0 || (header[8] == 0 && buckets > 2)) {
+            return 4;
+        }
+        const u64 hash = header[8] != 0 ? header[8] : manager + 0x98;
+        if (hash > std::numeric_limits<u64>::max() - 65536 * 4) {
+            return 4;
+        }
+        s32 index = -1;
+        if (!Read(hash + (static_cast<u32>(token) & (buckets - 1)) * 4, &index, sizeof(index))) {
+            return 3;
+        }
+        for (; index != -1 && steps < 16; ++steps) {
+            if (index < 0 || index >= 4096 || header[0] == 0 ||
+                header[0] > std::numeric_limits<u64>::max() - 4096 * 0x50) {
+                return 4;
+            }
+            const u64 address = header[0] + static_cast<u64>(index) * 0x50;
+            std::array<u64, 10> entry{};
+            if (!Read(address, entry.data(), sizeof(entry))) {
+                return 3;
+            }
+            if (entry[0] == token) {
+                record = address;
+                count = static_cast<u32>(entry[2]);
+                owner_count = static_cast<u32>(entry[4]);
+                owner_capacity = static_cast<u32>(entry[4] >> 32);
+                if (owner_count > 4096 || owner_capacity < owner_count) {
+                    return 4;
+                }
+                const u32 wanted = std::min<u32>(owner_count, owners.size());
+                flags = owner_count > owners.size() ? 1 : 0;
+                if (wanted != 0 && !Read(entry[3], owners.data(), wanted * sizeof(owners[0]))) {
+                    flags |= 2;
+                } else {
+                    sampled = wanted;
+                }
+                return 1;
+            }
+            index = static_cast<s32>(entry[9]);
+        }
+        return index == -1 ? 2 : 5;
+    }();
+    ++native_cache.token_records;
+    PadTrace::Record("DMC_RANGED_TOKEN", {static_cast<s64>(request),
+                                          static_cast<s64>(condition.object),
+                                          static_cast<s64>(condition.context),
+                                          static_cast<s64>(pawn),
+                                          static_cast<s64>(manager),
+                                          static_cast<s64>(token),
+                                          static_cast<s64>(handler),
+                                          status,
+                                          static_cast<s64>(record),
+                                          count,
+                                          owner_count,
+                                          owner_capacity,
+                                          sampled,
+                                          flags,
+                                          static_cast<s64>(owners[0]),
+                                          static_cast<s64>(owners[1]),
+                                          static_cast<s64>(owners[2]),
+                                          static_cast<s64>(owners[3]),
+                                          static_cast<s64>(owners[4]),
+                                          static_cast<s64>(owners[5]),
+                                          static_cast<s64>(owners[6]),
+                                          static_cast<s64>(owners[7]),
+                                          steps,
+                                          native_cache.gun_epoch});
+    NameSite(static_cast<u32>(token));
+    for (u32 i = 0; i < sampled; ++i) {
+        NameSite(static_cast<u32>(owners[i]));
+    }
+    if (native_cache.token_records == 128) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {17, 128});
+    }
 }
 
 void FireState(const char* kind, u64 request, u64 action, u64 node, u64 timeline,
@@ -1295,6 +1429,7 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
         }
         Identity(request, condition.function);
         Identity(request, condition.context);
+        RangedTokenState(request, condition);
     }
     for (u32 i = 0; i < trace.results.match_count; ++i) {
         const auto& match = trace.results.matches[i];
