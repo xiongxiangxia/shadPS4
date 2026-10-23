@@ -768,6 +768,7 @@ struct CompatState {
     u32 health_offset = 0;
     u64 controller_class = 0;
     u32 retries = 0;
+    u32 milestones = 0;
     std::chrono::steady_clock::time_point last_retry{};
     CompatGun gun = CompatGun::None;
     bool selecting = false;
@@ -852,6 +853,7 @@ void CompatController(u64 object) {
     compat.input = input;
     if (!CompatHeld()) {
         compat.gun = CompatGun::None;
+        compat.aggregator = 0;
     }
 }
 
@@ -867,8 +869,15 @@ bool CompatPending() {
         return false;
     }
     u32 charge = 0;
-    return compat.gun != CompatGun::None && compat.pawn != 0 && compat.charge_offset != 0 &&
-           Read(compat.pawn + compat.charge_offset, &charge, sizeof(charge)) && charge == 0;
+    const bool readable = compat.gun != CompatGun::None && compat.pawn != 0 &&
+                          compat.charge_offset != 0 &&
+                          Read(compat.pawn + compat.charge_offset, &charge, sizeof(charge));
+    if (readable && charge != 0 && (compat.milestones & 64) == 0) {
+        compat.milestones |= 64;
+        LOG_INFO(Input, "[DMC COMPAT] Game charge flag became nonzero; retries paused; raw={:#x}",
+                 charge);
+    }
+    return readable && charge == 0;
 }
 
 CompatGun CompatTarget(u64 definition) {
@@ -889,12 +898,18 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     thread_local bool interpreter_checked = false;
     if (!interpreter_checked) {
         const u64 slot = guest_base + 0x3960040 + 0x2d * 16;
-        if (Word(slot) != guest_base + 0x58880 || Word(slot + 8) != 0) {
+        const u64 target = Word(slot);
+        const u64 adjustment = Word(slot + 8);
+        if (target != guest_base + 0x55b90 || adjustment != 0) {
             compat_enabled = false;
-            LOG_ERROR(Input, "[DMC COMPAT] Bool opcode mismatch; experiment disabled");
+            LOG_ERROR(Input,
+                      "[DMC COMPAT] Bool opcode mismatch: target={:#x}, base={:#x}, "
+                      "adjustment={:#x}; experiment disabled",
+                      target, guest_base, adjustment);
             return compat_bool(object, frame, result);
         }
         interpreter_checked = true;
+        LOG_INFO(Input, "[DMC COMPAT] BoolVariable dispatch verified: RVA=0x55b90, adjustment=0");
     }
     const u64 code = Operand(frame);
     const bool instance = *reinterpret_cast<const u8*>(code) == 0x01;
@@ -902,6 +917,7 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     if (property != 0 && compat.consumed_property == 0 &&
         CompatName(property, "m_ConsumedHeldInput_RangedAttack")) {
         compat.consumed_property = property;
+        LOG_INFO(Input, "[DMC COMPAT] Ranged held-consumption property identified");
     }
     compat_bool(object, frame, result);
     if (result == nullptr || property == 0 || property != compat.consumed_property ||
@@ -910,10 +926,26 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
         return;
     }
     CompatController(reinterpret_cast<u64>(object));
+    if (compat.gun != CompatGun::None && (compat.milestones & 1) == 0) {
+        compat.milestones |= 1;
+        LOG_INFO(Input,
+                 "[DMC COMPAT] PlayerTick context: pawn={:#x}, input={:#x}, charge_offset={:#x}",
+                 compat.pawn, compat.input, compat.charge_offset);
+    }
     u32 buffered = 0;
     const auto now = std::chrono::steady_clock::now();
-    if (CompatPending() && compat.aggregator != 0 &&
-        Read(compat.aggregator + 0x80, &buffered, sizeof(buffered)) && buffered == 0 &&
+    const bool pending = CompatPending();
+    if (pending && compat.aggregator == 0 && (compat.milestones & 2) == 0) {
+        compat.milestones |= 2;
+        LOG_WARNING(Input, "[DMC COMPAT] Retry waiting: no gun aggregator observed");
+    }
+    const bool readable =
+        compat.aggregator != 0 && Read(compat.aggregator + 0x80, &buffered, sizeof(buffered));
+    if (pending && readable && buffered != 0 && (compat.milestones & 4) == 0) {
+        compat.milestones |= 4;
+        LOG_INFO(Input, "[DMC COMPAT] Existing buffered request retained: count={}", buffered);
+    }
+    if (pending && readable && buffered == 0 &&
         now - compat.last_retry >= std::chrono::milliseconds{100}) {
         u32 consumed = 0;
         std::memcpy(&consumed, result, sizeof(consumed));
@@ -991,6 +1023,7 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
             }
             compat.gun = gun;
             compat.retries = 0;
+            compat.milestones = 0;
         }
     }
 }
@@ -1011,6 +1044,12 @@ u32 CompatMatch(void* definition, void* event) {
     const u32 accepted = native_match_event(definition, event);
     *mode = previous_mode;
     compat.candidate = accepted != 0 ? address : 0;
+    const u32 bit = accepted != 0 ? 8 : 16;
+    if ((compat.milestones & bit) == 0) {
+        compat.milestones |= bit;
+        LOG_INFO(Input, "[DMC COMPAT] Charge event conditions: accepted={}, gun={}", accepted,
+                 static_cast<u32>(compat.gun));
+    }
     return accepted;
 }
 
@@ -1039,6 +1078,10 @@ void* CompatSelect(void* set, void* event) {
     }
     compat.candidate = 0;
     void* selected = native_select_link(set, event);
+    if (compat.selecting && selected != nullptr && (compat.milestones & 32) == 0) {
+        compat.milestones |= 32;
+        LOG_INFO(Input, "[DMC COMPAT] Charge entry selected; gun={}", static_cast<u32>(compat.gun));
+    }
     compat.selecting = previous;
     compat.candidate = previous_candidate;
     return selected;
@@ -2348,8 +2391,8 @@ void InstallNative() {
         LOG_INFO(Input, "[DMC COMPAT] Disabled by SHADPS4_DMC_COMPAT=0");
         return;
     }
-    constexpr std::array<u8, 14> bool_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53,
-                                            0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0xd3};
+    constexpr std::array<u8, 16> bool_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                            0x53, 0x50, 0x49, 0x89, 0xd6, 0x48, 0x89, 0xfb};
     constexpr std::array<u8, 17> compat_dispatch_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
                                                        0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
                                                        0x53, 0x48, 0x83, 0xec, 0x58};
@@ -2363,7 +2406,7 @@ void InstallNative() {
         auto actual = expected;
         return Read(address, actual.data(), actual.size()) && actual == expected;
     };
-    if (!matches(base + 0x58880, bool_bytes) || !matches(base + 0x567e0, compat_let_bytes) ||
+    if (!matches(base + 0x55b90, bool_bytes) || !matches(base + 0x567e0, compat_let_bytes) ||
         !matches(base + 0xa1f980, compat_let_bytes) ||
         !matches(base + 0x6d1e0, compat_dispatch_bytes) ||
         !matches(base + 0xa20850, compat_select_bytes) ||
@@ -2380,7 +2423,7 @@ void InstallNative() {
     native_aggregate_event = reinterpret_cast<AggregateEvent>(NativeEntry(
         base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), compat_let_bytes));
     compat_bool = reinterpret_cast<Native>(
-        NativeEntry(base + 0x58880, reinterpret_cast<u64>(&CompatBool), bool_bytes));
+        NativeEntry(base + 0x55b90, reinterpret_cast<u64>(&CompatBool), bool_bytes));
     original.store(reinterpret_cast<Native>(NativeEntry(
                        base + 0x567e0, reinterpret_cast<u64>(&CompatLet), compat_let_bytes)),
                    std::memory_order_release);
@@ -2388,7 +2431,9 @@ void InstallNative() {
                      native_select_link != nullptr && compat_bool != nullptr &&
                      native_aggregate_event != nullptr &&
                      original.load(std::memory_order_acquire) != nullptr;
-    LOG_INFO(Input, "[DMC COMPAT] Experimental held-charge retry enabled={}; no heavy probes",
+    LOG_INFO(Input,
+             "[DMC COMPAT] Entry hooks installed={}; awaiting BoolVariable verification; no "
+             "heavy probes",
              compat_enabled.load());
     return;
 #endif
