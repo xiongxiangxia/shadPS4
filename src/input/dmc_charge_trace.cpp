@@ -834,6 +834,84 @@ bool CompatClass(u64 object, const char* name) {
     return false;
 }
 
+struct CompatMetadataReader {
+    struct Region {
+        u64 begin = 0;
+        u64 end = 0;
+    };
+    std::array<Region, 64> regions{};
+    std::size_t next = 0;
+
+    bool Copy(u64 address, void* output, std::size_t size) {
+        if (address == 0 || size > std::numeric_limits<u64>::max() - address) {
+            return false;
+        }
+        const u64 end = address + size;
+        for (u64 cursor = address; cursor < end;) {
+            u64 region_end = 0;
+            for (const auto& region : regions) {
+                if (cursor >= region.begin && cursor < region.end) {
+                    region_end = region.end;
+                    break;
+                }
+            }
+            if (region_end == 0) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == 0 ||
+                    info.State != MEM_COMMIT ||
+                    (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+                    (info.Protect &
+                     (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                      PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) {
+                    return false;
+                }
+                region_end = reinterpret_cast<u64>(info.BaseAddress) + info.RegionSize;
+                if (region_end <= cursor) {
+                    return false;
+                }
+                regions[next++ % regions.size()] = {reinterpret_cast<u64>(info.BaseAddress),
+                                                    region_end};
+            }
+            cursor = region_end;
+        }
+        std::memcpy(output, reinterpret_cast<const void*>(address), size);
+        return true;
+    }
+
+    u64 Pointer(u64 address) {
+        u64 value = 0;
+        Copy(address, &value, sizeof(value));
+        return value;
+    }
+
+    bool Named(u64 field, u64 table, u32 count, const char* name) {
+        const u32 index = static_cast<u32>(Pointer(field + 0x48));
+        if (index == 0 || index >= count) {
+            return false;
+        }
+        const u64 entry = Pointer(table + static_cast<u64>(index) * 8);
+        u32 flags = 0;
+        if (entry == 0 || !Copy(entry, &flags, sizeof(flags))) {
+            return false;
+        }
+        const bool wide = (flags & 1) != 0;
+        const auto length = std::strlen(name);
+        const auto stride = wide ? 2 : 1;
+        std::array<u8, 64> bytes{};
+        const auto size = (length + 1) * stride;
+        if (size > bytes.size() || !Copy(entry + 0x10, bytes.data(), size)) {
+            return false;
+        }
+        for (std::size_t i = 0; i <= length; ++i) {
+            if (bytes[i * stride] != static_cast<u8>(name[i]) ||
+                (wide && bytes[i * stride + 1] != 0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
 u32 CompatOffset(u64 object, const char* name) {
     if (object == 0) {
         return 0;
@@ -843,13 +921,21 @@ u32 CompatOffset(u64 object, const char* name) {
     if (const auto found = offsets.find(key); found != offsets.end()) {
         return found->second;
     }
+    CompatMetadataReader metadata;
+    const u64 table = metadata.Pointer(guest_base + 0x3984330);
+    u32 names = 0;
+    if (table == 0 || !metadata.Copy(guest_base + 0x3984338, &names, sizeof(names)) || names == 0 ||
+        names > 2000000) {
+        return 0;
+    }
+    u32 visited = 0;
     for (u64 type = key.value, depth = 0; type != 0 && depth < 32;
-         type = Word(type + 0x68), ++depth) {
-        for (u64 field = Word(type + 0x70), count = 0; field != 0 && count < 2048;
-             field = Word(field + 0x60), ++count) {
-            if (CompatName(field, name)) {
+         type = metadata.Pointer(type + 0x68), ++depth) {
+        for (u64 field = metadata.Pointer(type + 0x70); field != 0 && visited < 4096;
+             field = metadata.Pointer(field + 0x60), ++visited) {
+            if (metadata.Named(field, table, names, name)) {
                 u32 offset = 0;
-                if (Read(field + 0x90, &offset, sizeof(offset)) && offset >= 0x58 &&
+                if (metadata.Copy(field + 0x90, &offset, sizeof(offset)) && offset >= 0x58 &&
                     offset < 0x10000) {
                     offsets.emplace(key, offset);
                     return offset;
@@ -971,6 +1057,42 @@ CompatGun CompatTarget(u64 definition) {
     return gun;
 }
 
+bool CompatBufferedGun(u32& count, bool& held_gun) {
+    if (compat.aggregator == 0 || compat.gun_descriptor == 0 ||
+        !Read(compat.aggregator + 0x80, &count, sizeof(count)) || count > 64) {
+        return false;
+    }
+    held_gun = false;
+    if (count == 0) {
+        return true;
+    }
+    std::array<u64, 64> events{};
+    const u64 array = Word(compat.aggregator + 0x78);
+    if (array == 0 || !Read(array, events.data(), count * sizeof(events[0]))) {
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        if (events[i] == 0) {
+            continue;
+        }
+        u64 descriptor = 0;
+        if (!Read(events[i] + 0x60, &descriptor, sizeof(descriptor))) {
+            return false;
+        }
+        if (descriptor == compat.gun_descriptor) {
+            u8 type = 0;
+            if (!Read(events[i] + 0x78, &type, sizeof(type))) {
+                return false;
+            }
+            if (type == 2) {
+                held_gun = true;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
 void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     if (!compat_enabled) {
         return compat_bool(object, frame, result);
@@ -1035,14 +1157,19 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
         compat.milestones |= 2;
         LOG_WARNING(Input, "[DMC COMPAT] Retry waiting: no gun aggregator observed");
     }
-    const bool readable =
-        compat.aggregator != 0 && Read(compat.aggregator + 0x80, &buffered, sizeof(buffered));
-    if (pending && readable && buffered != 0 && (compat.milestones & 4) == 0) {
+    bool buffered_gun = false;
+    const bool readable = pending && CompatBufferedGun(buffered, buffered_gun);
+    if (readable && buffered_gun && (compat.milestones & 4) == 0) {
         compat.milestones |= 4;
-        LOG_INFO(Input, "[DMC COMPAT] Existing buffered request retained: count={}", buffered);
+        LOG_INFO(Input, "[DMC COMPAT] Existing held-gun request retained: total_count={}",
+                 buffered);
     }
-    if (pending && readable && buffered == 0 &&
-        now - compat.last_retry >= std::chrono::milliseconds{100}) {
+    if (readable && !buffered_gun && buffered != 0 && (compat.milestones & 128) == 0) {
+        compat.milestones |= 128;
+        LOG_INFO(Input, "[DMC COMPAT] Other buffered inputs do not block gun retry: total_count={}",
+                 buffered);
+    }
+    if (readable && !buffered_gun && now - compat.last_retry >= std::chrono::milliseconds{100}) {
         u32 consumed = 0;
         std::memcpy(&consumed, result, sizeof(consumed));
         if (consumed == 0) {
@@ -1061,9 +1188,18 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
 void CompatDispatch(void* object, void* function, void* parameters, void* result, u64 caller) {
     const u64 address = reinterpret_cast<u64>(object);
     native_condition_dispatch(object, function, parameters, result);
-    if (!compat.selecting || parameters == nullptr || !CompatPending() ||
-        (caller != guest_base + 0xa2090c && caller != guest_base + 0xa235b9) ||
+    const bool graph_condition = caller == guest_base + 0xa1fee9;
+    const bool selection_condition =
+        compat.selecting && (caller == guest_base + 0xa2090c || caller == guest_base + 0xa235b9);
+    if ((!graph_condition && !selection_condition) || parameters == nullptr ||
+        compat.gun == CompatGun::None || !CompatPending() ||
         Word(reinterpret_cast<u64>(parameters) + 16) != compat.pawn) {
+        return;
+    }
+    const u64 event = Word(reinterpret_cast<u64>(parameters));
+    u8 type = 0;
+    if (event == 0 || compat.gun_descriptor == 0 || Word(event + 0x60) != compat.gun_descriptor ||
+        !Read(event + 0x78, &type, sizeof(type)) || type != 2) {
         return;
     }
     const u64 outer = Word(address + 0x40);
@@ -1071,11 +1207,21 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
                             CompatClass(address, "DVActionGraph_ConditionDef_Token") &&
                             NameIs(static_cast<u32>(Word(address + 0x60)), "RangedDenied");
     const bool original_weapon =
-        outer == compat.candidate && outer != 0 &&
+        selection_condition && outer == compat.candidate && outer != 0 &&
         CompatClass(address, "DVActionGraph_ConditionDef_SelectedRangedWeapon");
     if (root_token || original_weapon) {
+        u32 previous = 0;
+        std::memcpy(&previous, static_cast<u8*>(parameters) + 24, sizeof(previous));
         const u32 accepted = 1;
         std::memcpy(static_cast<u8*>(parameters) + 24, &accepted, sizeof(accepted));
+        const u32 bit = graph_condition ? 256 : 512;
+        if (previous == 0 && (compat.milestones & bit) == 0) {
+            compat.milestones |= bit;
+            LOG_INFO(Input,
+                     "[DMC COMPAT] Charge condition override: graph_preselection={}, "
+                     "root_token={}, original_weapon={}",
+                     graph_condition, root_token, original_weapon);
+        }
     }
 }
 
@@ -1112,17 +1258,23 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
         return;
     }
     const auto started = std::chrono::steady_clock::now();
-    const u64 pawn = CompatObject(address, "m_Dante");
-    const u64 controller = CompatObject(pawn, "m_Controller");
+    u32 owner_offset = 0;
+    const bool owner_valid =
+        CompatName(assignment.owner_property, "m_Dante") &&
+        Read(assignment.owner_property + 0x90, &owner_offset, sizeof(owner_offset)) &&
+        owner_offset >= 0x58 && owner_offset < 0x10000;
+    const u64 pawn = owner_valid ? Word(address + owner_offset) : 0;
+    const u64 controller = compat.controller;
     if (shot_site == 0) {
-        LOG_INFO(Input,
-                 "[DMC COMPAT] Normal-shot context: pawn={:#x}, m_Controller={:#x}, resolve_us={}",
-                 pawn, controller,
-                 std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::steady_clock::now() - started)
-                     .count());
+        LOG_INFO(
+            Input,
+            "[DMC COMPAT] Normal-shot context: pawn={:#x}, cached_controller={:#x}, resolve_us={}",
+            pawn, controller,
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                  started)
+                .count());
     }
-    if (controller != 0 && CompatClass(controller, "DVPlayerController_Dante")) {
+    if (controller != 0 && pawn != 0 && pawn == compat.pawn) {
         CompatController(controller);
         if (shot_site == 0) {
             u32 buttons = 0;
@@ -1197,8 +1349,8 @@ void* CompatSelect(void* set, void* event) {
     compat.selecting = CompatPending();
     if (compat.selecting) {
         const u64 set_address = reinterpret_cast<u64>(set);
-        const u64 links = LiveWord(set_address + 0x78);
-        const u32 count = LiveDword(set_address + 0x80);
+        const u64 links = LiveWord(set_address + 0x60);
+        const u32 count = LiveDword(set_address + 0x68);
         bool charge_entry = false;
         if (count <= 256) {
             for (u32 i = 0; links != 0 && i < count; ++i) {
@@ -2541,6 +2693,8 @@ void InstallNative() {
     compat_let_bytes.back() = 0x18;
     constexpr std::array<u8, 14> compat_match_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
                                                     0x56, 0x41, 0x54, 0x53, 0x49, 0x89, 0xf7};
+    constexpr std::array<u8, 10> compat_link_layout{0x41, 0x39, 0x5f, 0x68, 0x7e,
+                                                    0x26, 0x49, 0x8b, 0x47, 0x60};
     const auto matches = [](u64 address, const auto& expected) {
         auto actual = expected;
         return Read(address, actual.data(), actual.size()) && actual == expected;
@@ -2549,7 +2703,8 @@ void InstallNative() {
         !matches(base + 0xa1f980, compat_let_bytes) ||
         !matches(base + 0x6d1e0, compat_dispatch_bytes) ||
         !matches(base + 0xa20850, compat_select_bytes) ||
-        !matches(base + 0xa26420, compat_match_bytes)) {
+        !matches(base + 0xa26420, compat_match_bytes) ||
+        !matches(base + 0xa20973, compat_link_layout)) {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
     }
