@@ -773,12 +773,15 @@ struct CompatState {
     u32 pawn_offset = 0;
     u32 input_offset = 0;
     u32 health_offset = 0;
+    u32 mode_offset = 0;
+    u32 weapon_offset = 0;
     u64 controller_class = 0;
     u32 retries = 0;
     u32 milestones = 0;
     std::chrono::steady_clock::time_point last_retry{};
     CompatGun gun = CompatGun::None;
     bool selecting = false;
+    bool mode_held = false;
 };
 
 thread_local CompatState compat;
@@ -1034,8 +1037,11 @@ void CompatController(u64 object) {
         ++compat.generation;
         compat.gun = CompatGun::None;
         compat.aggregator = 0;
+        compat.mode_held = false;
         compat.charge_offset = CompatOffset(pawn, "m_fcpGunCharge");
         compat.health_offset = CompatOffset(pawn, "m_Health");
+        compat.mode_offset = CompatOffset(pawn, "m_Playmode");
+        compat.weapon_offset = CompatOffset(pawn, "m_ActiveRangedWeapon");
         LOG_INFO(Input,
                  "[DMC COMPAT] NTPawn layout: pawn={:#x}, input={:#x}, charge_offset={:#x}, "
                  "health_offset={:#x}, resolve_us={}",
@@ -1050,7 +1056,43 @@ void CompatController(u64 object) {
     if (!CompatHeld()) {
         compat.gun = CompatGun::None;
         compat.aggregator = 0;
+        compat.mode_held = false;
     }
+}
+
+void CompatModeIntent() {
+    if (compat.gun != CompatGun::None || compat.pawn == 0 || compat.mode_offset == 0 ||
+        compat.weapon_offset == 0 || !CompatHeld()) {
+        return;
+    }
+    u8 mode = 0xff;
+    if (!CompatRead(compat.pawn + compat.mode_offset, &mode, sizeof(mode))) {
+        return;
+    }
+    if (mode == 1 || mode == 2) {
+        compat.mode_held = true;
+        return;
+    }
+    if (mode != 0 || !compat.mode_held) {
+        return;
+    }
+    compat.mode_held = false;
+    u8 weapon = 0xff;
+    if (!CompatRead(compat.pawn + compat.weapon_offset, &weapon, sizeof(weapon))) {
+        return;
+    }
+    const auto gun = weapon == 0   ? CompatGun::Pistols
+                     : weapon == 1 ? CompatGun::Shotgun
+                                   : CompatGun::None;
+    if (gun == CompatGun::None) {
+        return;
+    }
+    compat.gun = gun;
+    ++compat.generation;
+    compat.retries = 0;
+    compat.milestones = 0;
+    LOG_INFO(Input, "[DMC COMPAT] Held gun intent after returning to human mode; gun={}",
+             static_cast<u32>(gun));
 }
 
 bool CompatPending() {
@@ -1198,6 +1240,7 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     compat_bool(object, frame, result);
     CompatMemoryScope memory{"tick"};
     CompatController(reinterpret_cast<u64>(object));
+    CompatModeIntent();
     if (compat.gun == CompatGun::None) {
         return;
     }
@@ -1354,6 +1397,7 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
                 LOG_INFO(Input, "[DMC COMPAT] Normal shot latched; gun={}", static_cast<u32>(gun));
             }
             compat.gun = gun;
+            compat.mode_held = false;
             ++compat.generation;
             compat.retries = 0;
             compat.milestones = 0;
@@ -1439,7 +1483,7 @@ void* CompatSelect(void* set, void* event) {
 
 u32 CompatAggregate(void* object, void* event, u32 input) {
     const u64 address = reinterpret_cast<u64>(event);
-    if (input != 0 && event != nullptr && compat.gun != CompatGun::None &&
+    if (input != 0 && event != nullptr && (compat.gun != CompatGun::None || compat.mode_held) &&
         *reinterpret_cast<const u8*>(address + 0x78) == 2) {
         CompatMemoryScope memory{"aggregate"};
         const u64 descriptor = LiveWord(address + 0x60);
