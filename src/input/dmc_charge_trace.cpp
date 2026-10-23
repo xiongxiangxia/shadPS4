@@ -783,6 +783,9 @@ struct CompatState {
 
 thread_local CompatState compat;
 
+bool CompatRead(u64 address, void* output, std::size_t size);
+u64 CompatWord(u64 address);
+
 struct CompatLookup {
     u64 value = 0;
     const char* name = nullptr;
@@ -807,7 +810,7 @@ bool CompatNameIndex(u32 index, const char* name) {
 }
 
 bool CompatName(u64 object, const char* name) {
-    return object != 0 && CompatNameIndex(static_cast<u32>(Word(object + 0x48)), name);
+    return object != 0 && CompatNameIndex(static_cast<u32>(CompatWord(object + 0x48)), name);
 }
 
 bool CompatFunction(u64 function, const char* name) {
@@ -819,12 +822,12 @@ bool CompatClass(u64 object, const char* name) {
         return false;
     }
     thread_local std::unordered_map<CompatLookup, bool, CompatLookupHash> classes;
-    const CompatLookup key{Word(object + 0x50), name};
+    const CompatLookup key{CompatWord(object + 0x50), name};
     if (const auto found = classes.find(key); found != classes.end()) {
         return found->second;
     }
     for (u64 type = key.value, depth = 0; type != 0 && depth < 32;
-         type = Word(type + 0x68), ++depth) {
+         type = CompatWord(type + 0x68), ++depth) {
         if (CompatName(type, name)) {
             classes.emplace(key, true);
             return true;
@@ -841,8 +844,12 @@ struct CompatMetadataReader {
     };
     std::array<Region, 64> regions{};
     std::size_t next = 0;
+    u32 reads = 0;
+    u32 queries = 0;
+    std::chrono::nanoseconds query_time{};
 
     bool Copy(u64 address, void* output, std::size_t size) {
+        ++reads;
         if (address == 0 || size > std::numeric_limits<u64>::max() - address) {
             return false;
         }
@@ -857,8 +864,12 @@ struct CompatMetadataReader {
             }
             if (region_end == 0) {
                 MEMORY_BASIC_INFORMATION info{};
-                if (VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == 0 ||
-                    info.State != MEM_COMMIT ||
+                const auto started = std::chrono::steady_clock::now();
+                const auto queried =
+                    VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info));
+                query_time += std::chrono::steady_clock::now() - started;
+                ++queries;
+                if (queried == 0 || info.State != MEM_COMMIT ||
                     (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
                     (info.Protect &
                      (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
@@ -912,16 +923,56 @@ struct CompatMetadataReader {
     }
 };
 
+thread_local CompatMetadataReader* compat_memory = nullptr;
+
+struct CompatMemoryScope {
+    CompatMetadataReader reader;
+    CompatMetadataReader* previous = compat_memory;
+    const char* label;
+
+    explicit CompatMemoryScope(const char* scope) : label{scope} {
+        if (previous == nullptr) {
+            compat_memory = &reader;
+        }
+    }
+    ~CompatMemoryScope() {
+        compat_memory = previous;
+        if (previous == nullptr && reader.query_time >= std::chrono::milliseconds{4}) {
+            thread_local u32 reports = 0;
+            if (reports++ < 8) {
+                LOG_INFO(
+                    Input,
+                    "[DMC COMPAT] Slow memory checks: scope={}, reads={}, queries={}, query_us={}",
+                    label, reader.reads, reader.queries,
+                    std::chrono::duration_cast<std::chrono::microseconds>(reader.query_time)
+                        .count());
+            }
+        }
+    }
+};
+
+bool CompatRead(u64 address, void* output, std::size_t size) {
+    return compat_memory != nullptr ? compat_memory->Copy(address, output, size)
+                                    : Read(address, output, size);
+}
+
+u64 CompatWord(u64 address) {
+    u64 value = 0;
+    CompatRead(address, &value, sizeof(value));
+    return value;
+}
+
 u32 CompatOffset(u64 object, const char* name) {
     if (object == 0) {
         return 0;
     }
     thread_local std::unordered_map<CompatLookup, u32, CompatLookupHash> offsets;
-    const CompatLookup key{Word(object + 0x50), name};
+    const CompatLookup key{CompatWord(object + 0x50), name};
     if (const auto found = offsets.find(key); found != offsets.end()) {
         return found->second;
     }
-    CompatMetadataReader metadata;
+    CompatMemoryScope memory{"offset"};
+    auto& metadata = *compat_memory;
     const u64 table = metadata.Pointer(guest_base + 0x3984330);
     u32 names = 0;
     if (table == 0 || !metadata.Copy(guest_base + 0x3984338, &names, sizeof(names)) || names == 0 ||
@@ -951,17 +1002,17 @@ u32 CompatOffset(u64 object, const char* name) {
 
 u64 CompatObject(u64 object, const char* name) {
     const u32 offset = CompatOffset(object, name);
-    return offset != 0 ? Word(object + offset) : 0;
+    return offset != 0 ? CompatWord(object + offset) : 0;
 }
 
 bool CompatHeld() {
     u32 buttons = 0;
-    return compat.input != 0 && Read(compat.input + 0x220, &buttons, sizeof(buttons)) &&
+    return compat.input != 0 && CompatRead(compat.input + 0x220, &buttons, sizeof(buttons)) &&
            (buttons & (1u << 6)) != 0;
 }
 
 void CompatController(u64 object) {
-    const u64 type = Word(object + 0x50);
+    const u64 type = CompatWord(object + 0x50);
     if (compat.controller_class != type) {
         const auto started = std::chrono::steady_clock::now();
         compat.controller_class = type;
@@ -975,8 +1026,8 @@ void CompatController(u64 object) {
                      std::chrono::steady_clock::now() - started)
                      .count());
     }
-    const u64 pawn = compat.pawn_offset != 0 ? Word(object + compat.pawn_offset) : 0;
-    const u64 input = compat.input_offset != 0 ? Word(object + compat.input_offset) : 0;
+    const u64 pawn = compat.pawn_offset != 0 ? CompatWord(object + compat.pawn_offset) : 0;
+    const u64 input = compat.input_offset != 0 ? CompatWord(object + compat.input_offset) : 0;
     if (compat.controller != object || compat.pawn != pawn || compat.input != input) {
         const auto started = std::chrono::steady_clock::now();
         compat_shot_site.store(0, std::memory_order_relaxed);
@@ -1006,26 +1057,31 @@ bool CompatPending() {
     if (compat.gun == CompatGun::None) {
         return false;
     }
+    u32 charge = 0;
+    if (compat.pawn == 0 || compat.charge_offset == 0 ||
+        !CompatRead(compat.pawn + compat.charge_offset, &charge, sizeof(charge))) {
+        return false;
+    }
+    if (charge != 0) {
+        if ((compat.milestones & 64) == 0) {
+            compat.milestones |= 64;
+            LOG_INFO(Input,
+                     "[DMC COMPAT] Game charge flag became nonzero; retries paused; raw={:#x}",
+                     charge);
+        }
+        return false;
+    }
     if (!CompatHeld()) {
         compat.gun = CompatGun::None;
         return false;
     }
     float health = 0.0f;
     if (compat.health_offset != 0 &&
-        Read(compat.pawn + compat.health_offset, &health, sizeof(health)) && health <= 0.0f) {
+        CompatRead(compat.pawn + compat.health_offset, &health, sizeof(health)) && health <= 0.0f) {
         compat.gun = CompatGun::None;
         return false;
     }
-    u32 charge = 0;
-    const bool readable = compat.gun != CompatGun::None && compat.pawn != 0 &&
-                          compat.charge_offset != 0 &&
-                          Read(compat.pawn + compat.charge_offset, &charge, sizeof(charge));
-    if (readable && charge != 0 && (compat.milestones & 64) == 0) {
-        compat.milestones |= 64;
-        LOG_INFO(Input, "[DMC COMPAT] Game charge flag became nonzero; retries paused; raw={:#x}",
-                 charge);
-    }
-    return readable && charge == 0;
+    return true;
 }
 
 CompatGun CompatTarget(u64 definition) {
@@ -1059,7 +1115,7 @@ CompatGun CompatTarget(u64 definition) {
 
 bool CompatBufferedGun(u32& count, bool& held_gun) {
     if (compat.aggregator == 0 || compat.gun_descriptor == 0 ||
-        !Read(compat.aggregator + 0x80, &count, sizeof(count)) || count > 64) {
+        !CompatRead(compat.aggregator + 0x80, &count, sizeof(count)) || count > 64) {
         return false;
     }
     held_gun = false;
@@ -1067,8 +1123,8 @@ bool CompatBufferedGun(u32& count, bool& held_gun) {
         return true;
     }
     std::array<u64, 64> events{};
-    const u64 array = Word(compat.aggregator + 0x78);
-    if (array == 0 || !Read(array, events.data(), count * sizeof(events[0]))) {
+    const u64 array = CompatWord(compat.aggregator + 0x78);
+    if (array == 0 || !CompatRead(array, events.data(), count * sizeof(events[0]))) {
         return false;
     }
     for (u32 i = 0; i < count; ++i) {
@@ -1076,12 +1132,12 @@ bool CompatBufferedGun(u32& count, bool& held_gun) {
             continue;
         }
         u64 descriptor = 0;
-        if (!Read(events[i] + 0x60, &descriptor, sizeof(descriptor))) {
+        if (!CompatRead(events[i] + 0x60, &descriptor, sizeof(descriptor))) {
             return false;
         }
         if (descriptor == compat.gun_descriptor) {
             u8 type = 0;
-            if (!Read(events[i] + 0x78, &type, sizeof(type))) {
+            if (!CompatRead(events[i] + 0x78, &type, sizeof(type))) {
                 return false;
             }
             if (type == 2) {
@@ -1140,6 +1196,7 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
         return compat_bool(object, frame, result);
     }
     compat_bool(object, frame, result);
+    CompatMemoryScope memory{"tick"};
     CompatController(reinterpret_cast<u64>(object));
     if (compat.gun == CompatGun::None) {
         return;
@@ -1192,20 +1249,25 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
     const bool selection_condition =
         compat.selecting && (caller == guest_base + 0xa2090c || caller == guest_base + 0xa235b9);
     if ((!graph_condition && !selection_condition) || parameters == nullptr ||
-        compat.gun == CompatGun::None || !CompatPending() ||
-        Word(reinterpret_cast<u64>(parameters) + 16) != compat.pawn) {
+        compat.gun == CompatGun::None) {
         return;
     }
-    const u64 event = Word(reinterpret_cast<u64>(parameters));
+    CompatMemoryScope memory{"condition"};
+    if (!CompatPending() || CompatWord(reinterpret_cast<u64>(parameters) + 16) != compat.pawn) {
+        return;
+    }
+    const u64 event = CompatWord(reinterpret_cast<u64>(parameters));
     u8 type = 0;
-    if (event == 0 || compat.gun_descriptor == 0 || Word(event + 0x60) != compat.gun_descriptor ||
-        !Read(event + 0x78, &type, sizeof(type)) || type != 2) {
+    if (event == 0 || compat.gun_descriptor == 0 ||
+        CompatWord(event + 0x60) != compat.gun_descriptor ||
+        !CompatRead(event + 0x78, &type, sizeof(type)) || type != 2) {
         return;
     }
-    const u64 outer = Word(address + 0x40);
-    const bool root_token = CompatName(outer, "RangeAttacksRoot") &&
-                            CompatClass(address, "DVActionGraph_ConditionDef_Token") &&
-                            NameIs(static_cast<u32>(Word(address + 0x60)), "RangedDenied");
+    const u64 outer = CompatWord(address + 0x40);
+    const bool root_token =
+        CompatName(outer, "RangeAttacksRoot") &&
+        CompatClass(address, "DVActionGraph_ConditionDef_Token") &&
+        CompatNameIndex(static_cast<u32>(CompatWord(address + 0x60)), "RangedDenied");
     const bool original_weapon =
         selection_condition && outer == compat.candidate && outer != 0 &&
         CompatClass(address, "DVActionGraph_ConditionDef_SelectedRangedWeapon");
@@ -1237,10 +1299,11 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
     if (shot_site == 0) {
         const u64 function = LiveWord(reinterpret_cast<u64>(frame) + 0x18);
         if (!CompatFunction(function, "OnStart") ||
-            !CompatName(Word(function + 0x40), "DVAction_Dante_RangedAttack")) {
+            !CompatName(CompatWord(function + 0x40), "DVAction_Dante_RangedAttack")) {
             return original.load(std::memory_order_acquire)(object, frame, result);
         }
     }
+    CompatMemoryScope memory{"shot"};
     const u64 address = reinterpret_cast<u64>(object);
     const auto gun = CompatClass(address, "DVAction_Dante_ShotgunShot")      ? CompatGun::Shotgun
                      : CompatClass(address, "DVAction_Dante_EbonyIvoryShot") ? CompatGun::Pistols
@@ -1261,9 +1324,9 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
     u32 owner_offset = 0;
     const bool owner_valid =
         CompatName(assignment.owner_property, "m_Dante") &&
-        Read(assignment.owner_property + 0x90, &owner_offset, sizeof(owner_offset)) &&
+        CompatRead(assignment.owner_property + 0x90, &owner_offset, sizeof(owner_offset)) &&
         owner_offset >= 0x58 && owner_offset < 0x10000;
-    const u64 pawn = owner_valid ? Word(address + owner_offset) : 0;
+    const u64 pawn = owner_valid ? CompatWord(address + owner_offset) : 0;
     const u64 controller = compat.controller;
     if (shot_site == 0) {
         LOG_INFO(
@@ -1279,7 +1342,7 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
         if (shot_site == 0) {
             u32 buttons = 0;
             const bool readable =
-                compat.input != 0 && Read(compat.input + 0x220, &buttons, sizeof(buttons));
+                compat.input != 0 && CompatRead(compat.input + 0x220, &buttons, sizeof(buttons));
             LOG_INFO(Input,
                      "[DMC COMPAT] Shot eligibility: same_pawn={}, input_readable={}, "
                      "input_mask={:#x}, square_held={}",
@@ -1306,6 +1369,7 @@ u32 CompatMatch(void* definition, void* event) {
     if (!compat.selecting) {
         return native_match_event(definition, event);
     }
+    CompatMemoryScope memory{"match"};
     const u64 address = reinterpret_cast<u64>(definition);
     const auto target = CompatTarget(address);
     if (target == CompatGun::None || target != compat.gun) {
@@ -1346,6 +1410,7 @@ void* CompatSelect(void* set, void* event) {
         *reinterpret_cast<const u8*>(address + 0x78) != 2) {
         return native_select_link(set, event);
     }
+    CompatMemoryScope memory{"select"};
     compat.selecting = CompatPending();
     if (compat.selecting) {
         const u64 set_address = reinterpret_cast<u64>(set);
@@ -1376,6 +1441,7 @@ u32 CompatAggregate(void* object, void* event, u32 input) {
     const u64 address = reinterpret_cast<u64>(event);
     if (input != 0 && event != nullptr && compat.gun != CompatGun::None &&
         *reinterpret_cast<const u8*>(address + 0x78) == 2) {
+        CompatMemoryScope memory{"aggregate"};
         const u64 descriptor = LiveWord(address + 0x60);
         if (descriptor != 0 &&
             (descriptor == compat.gun_descriptor ||
