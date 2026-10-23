@@ -877,19 +877,35 @@ bool CompatHeld() {
 void CompatController(u64 object) {
     const u64 type = Word(object + 0x50);
     if (compat.controller_class != type) {
+        const auto started = std::chrono::steady_clock::now();
         compat.controller_class = type;
         compat.pawn_offset = CompatOffset(object, "m_NTPawn");
         compat.input_offset = CompatOffset(object, "m_NTInput");
+        LOG_INFO(Input,
+                 "[DMC COMPAT] Controller layout: pawn_offset={:#x}, input_offset={:#x}, "
+                 "resolve_us={}",
+                 compat.pawn_offset, compat.input_offset,
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count());
     }
     const u64 pawn = compat.pawn_offset != 0 ? Word(object + compat.pawn_offset) : 0;
     const u64 input = compat.input_offset != 0 ? Word(object + compat.input_offset) : 0;
     if (compat.controller != object || compat.pawn != pawn || compat.input != input) {
+        const auto started = std::chrono::steady_clock::now();
         compat_shot_site.store(0, std::memory_order_relaxed);
         ++compat.generation;
         compat.gun = CompatGun::None;
         compat.aggregator = 0;
         compat.charge_offset = CompatOffset(pawn, "m_fcpGunCharge");
-        compat.health_offset = CompatOffset(pawn, "Health");
+        compat.health_offset = CompatOffset(pawn, "m_Health");
+        LOG_INFO(Input,
+                 "[DMC COMPAT] NTPawn layout: pawn={:#x}, input={:#x}, charge_offset={:#x}, "
+                 "health_offset={:#x}, resolve_us={}",
+                 pawn, input, compat.charge_offset, compat.health_offset,
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count());
     }
     compat.controller = object;
     compat.pawn = pawn;
@@ -908,9 +924,9 @@ bool CompatPending() {
         compat.gun = CompatGun::None;
         return false;
     }
-    s32 health = 0;
+    float health = 0.0f;
     if (compat.health_offset != 0 &&
-        Read(compat.pawn + compat.health_offset, &health, sizeof(health)) && health <= 0) {
+        Read(compat.pawn + compat.health_offset, &health, sizeof(health)) && health <= 0.0f) {
         compat.gun = CompatGun::None;
         return false;
     }
@@ -1095,10 +1111,29 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
     if (!shot || !compat_enabled) {
         return;
     }
+    const auto started = std::chrono::steady_clock::now();
     const u64 pawn = CompatObject(address, "m_Dante");
-    const u64 controller = CompatObject(pawn, "Controller");
+    const u64 controller = CompatObject(pawn, "m_Controller");
+    if (shot_site == 0) {
+        LOG_INFO(Input,
+                 "[DMC COMPAT] Normal-shot context: pawn={:#x}, m_Controller={:#x}, resolve_us={}",
+                 pawn, controller,
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count());
+    }
     if (controller != 0 && CompatClass(controller, "DVPlayerController_Dante")) {
         CompatController(controller);
+        if (shot_site == 0) {
+            u32 buttons = 0;
+            const bool readable =
+                compat.input != 0 && Read(compat.input + 0x220, &buttons, sizeof(buttons));
+            LOG_INFO(Input,
+                     "[DMC COMPAT] Shot eligibility: same_pawn={}, input_readable={}, "
+                     "input_mask={:#x}, square_held={}",
+                     pawn == compat.pawn, readable, buttons,
+                     readable && (buttons & (1u << 6)) != 0);
+        }
         if (pawn == compat.pawn && CompatHeld()) {
             if (compat.gun != gun) {
                 LOG_INFO(Input, "[DMC COMPAT] Normal shot latched; gun={}", static_cast<u32>(gun));

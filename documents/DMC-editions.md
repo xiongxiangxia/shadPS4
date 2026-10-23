@@ -27,6 +27,16 @@
 
 这些是静态可核查的开销削减，实际帧率及蓄力效果仍未验证；优先检查游玩流畅度，不要求额外F9重录。关闭实验需完全退出并通过off启动器重启。
 
+## NTPawn 上下文字段修正
+
+63985首测普通日志确认 BoolVariable 入口验证成功、消费属性已识别、射击赋值地址已定位，但没有射击意图、重试或蓄力入口记录。不能把这轮称为实际重试后仍被拒绝。
+
+核对游戏包得到：DVPawn_Dante → DVPawn_Dante_Native → DVPawn_Player → DVPawn → NTPawn → NTAnimatedActor → NTGameObject → Engine.Actor。它不是 Engine.Pawn。原兼容代码假设的 `Controller`、`Health` 不适用于这里：`NTPawn.SetController` 明确写入 `m_Controller`（对象）及 `m_NTController`（接口），生命字段是 `NTPawn.m_Health`（FloatProperty）。
+
+修正为读取 `m_Controller`、按float读取 `m_Health`，不更改原游戏文件。此前缺失Controller字段足以阻止射击意图成立；查找不存在字段也是冷路径开销来源。但普通日志没有帧时间，本轮附近同时存在shader/pipeline编译，不能断言全部冻结都是同一原因。
+
+增加只在类型／角色上下文变化及首次射击地址发现时输出的字段偏移和查找耗时（微秒），不是逐帧日志。用于确认字段获取及冷查找成本；不代表已验证流畅度、原始蓄力bug或模拟器根因。
+
 ## COMPAT-experimental：先测试玩法
 
 专用编译开关 `ENABLE_DMC_CHARGE_COMPAT=ON`。此产物默认启用；`SHADPS4_DMC_COMPAT=0` 可禁用，必须重新启动模拟器。与 F9 无关。不安装重诊断探针，游玩时不要按 F9。
