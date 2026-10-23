@@ -758,6 +758,7 @@ std::atomic<bool> compat_enabled{false};
 std::atomic<u64> compat_consumed_property{0};
 std::atomic<u64> compat_player_tick{0};
 std::atomic<u64> compat_shot_site{0};
+std::atomic<u64> jc_generation{0};
 
 enum class CompatGun { None, Pistols, Shotgun };
 
@@ -965,6 +966,169 @@ u64 CompatWord(u64 address) {
     return value;
 }
 
+struct JcCapture {
+    u64 generation = 0;
+    u64 active = 0;
+    u32 kind = 0;
+    u32 records = 0;
+    std::unordered_map<u32, bool> names;
+};
+
+thread_local JcCapture jc;
+
+bool JcBudget() {
+    if (!PadTrace::Enabled()) {
+        return false;
+    }
+    const u64 generation = jc_generation.load(std::memory_order_relaxed);
+    if (jc.generation != generation) {
+        jc = {};
+        jc.generation = generation;
+    }
+    if (jc.records >= 4096) {
+        return false;
+    }
+    if (++jc.records == 4096) {
+        PadTrace::Record("JC_LIMIT", {4096});
+        return false;
+    }
+    return true;
+}
+
+void JcName(u32 index) {
+    if (index == 0 || jc.names.contains(index) || jc.names.size() >= 128 || !JcBudget()) {
+        return;
+    }
+    const u64 table = CompatWord(guest_base + 0x3984330);
+    u32 count = 0;
+    if (table == 0 || !CompatRead(guest_base + 0x3984338, &count, sizeof(count)) ||
+        index >= count || count > 2000000) {
+        return;
+    }
+    const u64 entry = CompatWord(table + static_cast<u64>(index) * 8);
+    u32 flags = 0;
+    std::array<u64, 16> text{};
+    if (entry == 0 || !CompatRead(entry, &flags, sizeof(flags)) ||
+        !CompatRead(entry + 0x10, text.data(), sizeof(text))) {
+        return;
+    }
+    jc.names.emplace(index, true);
+    PadTrace::Record(
+        "JC_NAME",
+        {index, flags & 1, static_cast<s64>(text[0]), static_cast<s64>(text[1]),
+         static_cast<s64>(text[2]), static_cast<s64>(text[3]), static_cast<s64>(text[4]),
+         static_cast<s64>(text[5]), static_cast<s64>(text[6]), static_cast<s64>(text[7]),
+         static_cast<s64>(text[8]), static_cast<s64>(text[9]), static_cast<s64>(text[10]),
+         static_cast<s64>(text[11]), static_cast<s64>(text[12]), static_cast<s64>(text[13]),
+         static_cast<s64>(text[14]), static_cast<s64>(text[15])});
+}
+
+void JcIdentity(u64 object) {
+    if (object == 0 || !JcBudget()) {
+        return;
+    }
+    const u64 name = CompatWord(object + 0x48);
+    const u64 type = CompatWord(object + 0x50);
+    const u64 class_name = type != 0 ? CompatWord(type + 0x48) : 0;
+    PadTrace::Record("JC_OBJECT",
+                     {static_cast<s64>(jc.active), static_cast<s64>(object), static_cast<s64>(name),
+                      static_cast<s64>(type), static_cast<s64>(class_name)});
+    JcName(static_cast<u32>(name));
+    JcName(static_cast<u32>(class_name));
+}
+
+struct JcScope {
+    u64 request = 0;
+    u64 previous = 0;
+    u32 previous_kind = 0;
+    u64 generation = 0;
+    u32 stage;
+    u64 object;
+    bool entered = false;
+
+    JcScope(u32 step, void* owner, void* event, u64 caller)
+        : stage{step}, object{reinterpret_cast<u64>(owner)} {
+        if (!PadTrace::Enabled()) {
+            return;
+        }
+        generation = jc_generation.load(std::memory_order_relaxed);
+        if (jc.generation != generation) {
+            jc = {};
+            jc.generation = generation;
+        }
+        previous = jc.active;
+        previous_kind = jc.kind;
+        entered = true;
+        jc.active = 0;
+        jc.kind = 0;
+        if (event == nullptr) {
+            return;
+        }
+        if (jc.generation == jc_generation.load(std::memory_order_relaxed) && jc.records >= 4096) {
+            return;
+        }
+        const u64 address = reinterpret_cast<u64>(event);
+        const u64 descriptor = LiveWord(address + 0x60);
+        const u32 name = descriptor != 0 ? static_cast<u32>(CompatWord(descriptor + 0x48)) : 0;
+        const u32 kind = CompatNameIndex(name, "DVButton_Jump")           ? 1
+                         : CompatNameIndex(name, "DVButton_LightMelee")   ? 2
+                         : CompatNameIndex(name, "DVButton_StrongMelee")  ? 3
+                         : CompatNameIndex(name, "DVButton_RangedAttack") ? 4
+                                                                          : 0;
+        if (kind == 0 || !JcBudget()) {
+            return;
+        }
+        request = PadTrace::NextId();
+        jc.active = request;
+        jc.kind = kind;
+        u32 buttons = 0;
+        const bool buttons_valid =
+            compat.input != 0 && CompatRead(compat.input + 0x220, &buttons, sizeof(buttons));
+        PadTrace::Record("JC_BEGIN",
+                         {static_cast<s64>(request), static_cast<s64>(previous), stage,
+                          static_cast<s64>(this->object), static_cast<s64>(address), kind,
+                          *reinterpret_cast<const u8*>(address + 0x78), LiveDword(address + 0x68),
+                          LiveDword(address + 0x6c), *reinterpret_cast<const u8*>(address + 0x90),
+                          LiveDword(address + 0xa0), buttons, buttons_valid,
+                          static_cast<s64>(compat.input), static_cast<s64>(caller - guest_base)});
+        if (stage == 0) {
+            Node(0);
+        }
+    }
+
+    void Node(u32 phase) {
+        const u64 node = CompatWord(object + 0x88);
+        if (JcBudget()) {
+            PadTrace::Record("JC_ACTIVE", {static_cast<s64>(request), phase,
+                                           static_cast<s64>(object), static_cast<s64>(node)});
+            JcIdentity(node);
+        }
+    }
+
+    void End(u64 result) {
+        if (request != 0 && JcBudget()) {
+            PadTrace::Record("JC_END",
+                             {static_cast<s64>(request), stage, static_cast<s64>(result)});
+            if (stage == 0) {
+                Node(1);
+            } else if (stage == 2 && result != 0) {
+                const u64 definition = CompatWord(result + 0x60);
+                JcIdentity(definition);
+                JcIdentity(CompatObjectTarget(definition));
+            }
+        }
+    }
+
+    static u64 CompatObjectTarget(u64 definition);
+
+    ~JcScope() {
+        if (entered && jc.generation == generation) {
+            jc.active = previous;
+            jc.kind = previous_kind;
+        }
+    }
+};
+
 u32 CompatOffset(u64 object, const char* name) {
     if (object == 0) {
         return 0;
@@ -1006,6 +1170,10 @@ u32 CompatOffset(u64 object, const char* name) {
 u64 CompatObject(u64 object, const char* name) {
     const u32 offset = CompatOffset(object, name);
     return offset != 0 ? CompatWord(object + offset) : 0;
+}
+
+u64 JcScope::CompatObjectTarget(u64 definition) {
+    return definition != 0 ? CompatObject(definition, "TargetNode") : 0;
 }
 
 bool CompatHeld() {
@@ -1288,6 +1456,33 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
 void CompatDispatch(void* object, void* function, void* parameters, void* result, u64 caller) {
     const u64 address = reinterpret_cast<u64>(object);
     native_condition_dispatch(object, function, parameters, result);
+    if (jc.active != 0 && function != nullptr && caller >= guest_base + 0xa18780 &&
+        caller < guest_base + 0xa18a00 && JcBudget()) {
+        PadTrace::Record("JC_LIFECYCLE",
+                         {static_cast<s64>(jc.active), static_cast<s64>(address),
+                          reinterpret_cast<s64>(function), static_cast<s64>(caller - guest_base)});
+        JcIdentity(address);
+        JcIdentity(reinterpret_cast<u64>(function));
+    }
+    if (jc.active != 0 && parameters != nullptr &&
+        (caller == guest_base + 0xa1fee9 || caller == guest_base + 0xa2090c ||
+         caller == guest_base + 0xa235b9) &&
+        JcBudget()) {
+        PadTrace::Record("JC_CONDITION",
+                         {static_cast<s64>(jc.active), static_cast<s64>(caller - guest_base),
+                          static_cast<s64>(address), reinterpret_cast<s64>(function),
+                          static_cast<s64>(LiveWord(reinterpret_cast<u64>(parameters) + 8)),
+                          static_cast<s64>(LiveWord(reinterpret_cast<u64>(parameters) + 16)),
+                          LiveDword(reinterpret_cast<u64>(parameters) + 24)});
+        JcIdentity(address);
+        JcIdentity(CompatWord(address + 0x40));
+        if (CompatClass(address, "DVActionGraph_ConditionDef_Token")) {
+            const u64 token = CompatWord(address + 0x60);
+            PadTrace::Record("JC_TOKEN", {static_cast<s64>(jc.active), static_cast<s64>(address),
+                                          static_cast<s64>(token)});
+            JcName(static_cast<u32>(token));
+        }
+    }
     const bool graph_condition = caller == guest_base + 0xa1fee9;
     const bool selection_condition =
         compat.selecting && (caller == guest_base + 0xa2090c || caller == guest_base + 0xa235b9);
@@ -2088,7 +2283,13 @@ void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* p
 u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     if (compat_enabled) {
-        return CompatMatch(definition, event);
+        const u32 result = CompatMatch(definition, event);
+        if (jc.active != 0 && JcBudget()) {
+            PadTrace::Record("JC_MATCH", {static_cast<s64>(jc.active),
+                                          reinterpret_cast<s64>(definition), result});
+            JcIdentity(reinterpret_cast<u64>(definition));
+        }
+        return result;
     }
 #endif
     auto* trace = active_gate;
@@ -2120,6 +2321,13 @@ u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
 void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     if (compat_enabled) {
+        if (PadTrace::Enabled()) {
+            CompatMemoryScope memory{"jc_select"};
+            JcScope trace{2, set, event, reinterpret_cast<u64>(__builtin_return_address(0))};
+            void* selected = CompatSelect(set, event);
+            trace.End(reinterpret_cast<u64>(selected));
+            return selected;
+        }
         return CompatSelect(set, event);
     }
 #endif
@@ -2345,6 +2553,18 @@ u32 TraceGunReplay(void* graph, void* event, u64 caller) {
 }
 
 u32 PS4_SYSV_ABI ObserveGraphEvent(void* graph, void* event) {
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    if (compat_enabled) {
+        if (!PadTrace::Enabled()) {
+            return native_graph_event(graph, event);
+        }
+        CompatMemoryScope memory{"jc_graph"};
+        JcScope trace{0, graph, event, reinterpret_cast<u64>(__builtin_return_address(0))};
+        const u32 result = native_graph_event(graph, event);
+        trace.End(result);
+        return result;
+    }
+#endif
     if (!PadTrace::Enabled()) {
         return native_graph_event(graph, event);
     }
@@ -2508,6 +2728,13 @@ u32 AggregateContext(u64 request, void* event) {
 u32 PS4_SYSV_ABI ObserveAggregateEvent(void* object, void* event, u32 input) {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     if (compat_enabled) {
+        if (PadTrace::Enabled()) {
+            CompatMemoryScope memory{"jc_aggregate"};
+            JcScope trace{1, object, event, reinterpret_cast<u64>(__builtin_return_address(0))};
+            const u32 result = CompatAggregate(object, event, input);
+            trace.End(result);
+            return result;
+        }
         return CompatAggregate(object, event, input);
     }
 #endif
@@ -2814,6 +3041,7 @@ void InstallNative() {
         !matches(base + 0x6d1e0, compat_dispatch_bytes) ||
         !matches(base + 0xa20850, compat_select_bytes) ||
         !matches(base + 0xa26420, compat_match_bytes) ||
+        !matches(base + 0xa1fe10, compat_select_bytes) ||
         !matches(base + 0xa20973, compat_link_layout)) {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
@@ -2824,6 +3052,8 @@ void InstallNative() {
         NativeEntry(base + 0xa26420, reinterpret_cast<u64>(&ObserveGateMatch), compat_match_bytes));
     native_select_link = reinterpret_cast<SelectLink>(NativeEntry(
         base + 0xa20850, reinterpret_cast<u64>(&ObserveSelectLink), compat_select_bytes));
+    native_graph_event = reinterpret_cast<GraphEvent>(NativeEntry(
+        base + 0xa1fe10, reinterpret_cast<u64>(&ObserveGraphEvent), compat_select_bytes));
     native_aggregate_event = reinterpret_cast<AggregateEvent>(NativeEntry(
         base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), compat_let_bytes));
     compat_bool = reinterpret_cast<Native>(
@@ -2832,8 +3062,8 @@ void InstallNative() {
                        base + 0x567e0, reinterpret_cast<u64>(&CompatLet), compat_let_bytes)),
                    std::memory_order_release);
     compat_enabled = native_condition_dispatch != nullptr && native_match_event != nullptr &&
-                     native_select_link != nullptr && compat_bool != nullptr &&
-                     native_aggregate_event != nullptr &&
+                     native_graph_event != nullptr && native_select_link != nullptr &&
+                     compat_bool != nullptr && native_aggregate_event != nullptr &&
                      original.load(std::memory_order_acquire) != nullptr;
     LOG_INFO(Input,
              "[DMC COMPAT] Entry hooks installed={}; awaiting BoolVariable verification; no "
@@ -2943,6 +3173,8 @@ void InstallNative() {
 
 void Install() {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
+    jc_generation.fetch_add(1, std::memory_order_relaxed);
+    PadTrace::Record("JC_CAPTURE", {1, 4096, 128, compat_enabled.load()});
     return;
 #endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);

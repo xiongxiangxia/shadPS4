@@ -43,6 +43,7 @@ jobs:
           Copy-Item build\shadPS4.exe package\shadPS4.exe
           Copy-Item documents\DMC-editions.md package\READ-ME-FIRST.md
           if ('${{ matrix.compatibility }}' -eq 'ON') {
+            Copy-Item documents\DMC-JC-capture.md package\JC-CAPTURE.md
             Copy-Item tools\dmc-compat-on.cmd package\
             Copy-Item tools\dmc-compat-off.cmd package\
           } else {
