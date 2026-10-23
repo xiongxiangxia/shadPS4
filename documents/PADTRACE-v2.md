@@ -515,6 +515,34 @@ observed match must not be assigned a guessed accepting definition. Configuratio
 the successful definition uses DMC_GATE_EVENT_CONFIG keyed by the buffer-call request.
 No predicate is re-evaluated, and no additional native detour is installed.
 
+### Held-gun replay correlation
+
+The existing graph-input observer now also records held-gun events called from the two
+validated replay sites (relative return addresses 0xa1f8e3 and 0xa1f913), even outside a
+live input request. This closes a previous coverage gap; absence in older graph logs did
+not prove replay was absent. No additional detour or guest behavior change is installed.
+At most 64 replays per capture are recorded; native limit 18 reports exhaustion.
+
+| kind | p0 onwards, in order |
+| --- | --- |
+| DMC_GUN_REPLAY_BEGIN | replay request, native caller, graph, event, descriptor, entry combo, entry flags, entry play mode, entry held mask, tracked shot serial, gun epoch, previous aggregate parent |
+| DMC_GUN_REPLAY_END | replay request, graph handler result |
+| DMC_AWAKE_QUEUE | awake request, phase (0 before / 1 after), aggregator, processing graph, flags, primary queue count, secondary queue count, pending count, pending owner, tracked shot serial |
+
+DMC_GRAPH phase 0/1 records bracket each replay with its request. DMC_GATE_SELECT appends
+replay request at p11; selector deduplication is bypassed only inside these bounded replay
+calls, while its existing overall budget still applies. The replay request temporarily
+becomes the diagnostic aggregate parent, not a new physical input event. Event fields
+are captured only before replay: pooled input is not dereferenced after dispatch.
+Successful return means graph acceptance, not necessarily charge startup. Missing END
+means incomplete observation, not result zero. Static caller identity distinguishes
+operation types 6 and 7; a sample does not establish an exhaustive queue history.
+
+Awake probes additionally snapshot the existing pending buffer at phase 2 and queue counts
+before/after the original call. They share its shot-event budget. A drained queue can be
+normal immediate replay, not lost input. Outside-thread replay, other call sites and budget
+exhaustion remain coverage limits; tracked shot serial alone does not identify event origin.
+
 ### Bounded RangedDenied ownership snapshots
 
 DMC_RANGED_TOKEN is emitted only alongside an already-sampled gate condition matching the

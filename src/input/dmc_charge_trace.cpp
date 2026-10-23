@@ -377,6 +377,8 @@ struct NativeCache {
     u32 exit_records = 0;
     u32 gate_records = 0;
     u32 token_records = 0;
+    u32 replay_records = 0;
+    u64 replay_request = 0;
     u64 ranged_denied_name = 0;
     u32 gun_since = 0;
     u32 gun_epoch = 0;
@@ -1107,7 +1109,25 @@ void PS4_SYSV_ABI ObserveAwake(void* node, void* frame, void* result) {
                       static_cast<s64>(native_cache.aggregate_request),
                       native_cache.timeline_delta});
     FireState("DMC_FIRE_AWAKE_BEGIN", request, action, address, timeline, name);
+    const u64 graph = Word(address + 0x70);
+    const u64 aggregator = graph != 0 ? Word(graph + 0x78) : 0;
+    const auto queue_state = [&](u32 phase) {
+        if (aggregator == 0) {
+            return;
+        }
+        PadTrace::Record("DMC_AWAKE_QUEUE",
+                         {static_cast<s64>(request), phase, static_cast<s64>(aggregator),
+                          static_cast<s64>(LiveWord(aggregator + 0xa8)),
+                          LiveDword(aggregator + 0xb0), LiveDword(aggregator + 0xc0),
+                          LiveDword(aggregator + 0xd0), LiveDword(aggregator + 0x80),
+                          static_cast<s64>(LiveWord(aggregator + 0xa0)), native_cache.fire_serial});
+    };
+    queue_state(0);
+    if (aggregator != 0) {
+        BufferState(request, 2, SnapshotBuffer(aggregator + 0x78));
+    }
     native_awake(node, frame, result);
+    queue_state(1);
     FireState("DMC_FIRE_AWAKE_END", request, action, address, timeline, name);
     NameSite(static_cast<u32>(name));
     Identity(request, outer);
@@ -1391,8 +1411,9 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
         PadTrace::Record("DMC_NATIVE_LIMIT", {13, 128});
         return selected;
     }
-    const bool repeated = sample->set == address && sample->descriptor == descriptor &&
-                          sample->type == type && sample->epoch == native_cache.gun_epoch &&
+    const bool repeated = native_cache.replay_request == 0 && sample->set == address &&
+                          sample->descriptor == descriptor && sample->type == type &&
+                          sample->epoch == native_cache.gun_epoch &&
                           sample->selected == selected_address && sample->results == trace.results;
     *sample = {address, descriptor, selected_address, type, native_cache.gun_epoch, trace.results};
     if (repeated) {
@@ -1406,7 +1427,8 @@ void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
                       trace.results.condition_count, trace.results.match_count,
                       trace.results.clipped, native_cache.gun_epoch,
                       static_cast<s64>(native_cache.aggregate_request),
-                      reinterpret_cast<s64>(__builtin_return_address(0))});
+                      reinterpret_cast<s64>(__builtin_return_address(0)),
+                      static_cast<s64>(native_cache.replay_request)});
     PadTrace::Record("DMC_GATE_INPUT", {static_cast<s64>(request), input.valid, input.combo,
                                         input.flags, input.type, input.motion, input.mode,
                                         input.focus, input.held, static_cast<s64>(input.upgrades)});
@@ -1527,9 +1549,50 @@ u32 PS4_SYSV_ABI ObserveBufferEvent(void* buffer, void* owner, void* event, void
     return result;
 }
 
+u32 TraceGunReplay(void* graph, void* event, u64 caller) {
+    const u64 address = reinterpret_cast<u64>(event);
+    const u64 graph_address = reinterpret_cast<u64>(graph);
+    const u64 request = PadTrace::NextId();
+    ++native_cache.replay_records;
+    const auto before = SnapshotGraph(graph_address);
+    PadTrace::Record("DMC_GUN_REPLAY_BEGIN",
+                     {static_cast<s64>(request), static_cast<s64>(caller),
+                      static_cast<s64>(graph_address), static_cast<s64>(address),
+                      static_cast<s64>(LiveWord(address + 0x60)), LiveDword(address + 0x68),
+                      LiveDword(address + 0x6c), *reinterpret_cast<const u8*>(address + 0x90),
+                      LiveDword(address + 0xa0), native_cache.fire_serial, native_cache.gun_epoch,
+                      static_cast<s64>(native_cache.aggregate_request)});
+    GraphState(request, 0, before);
+    u32 result = 0;
+    const u64 previous_replay = native_cache.replay_request;
+    native_cache.replay_request = request;
+    {
+        const AggregateScope scope{request, 2, LiveDword(address + 0xa0), address};
+        result = native_graph_event(graph, event);
+    }
+    native_cache.replay_request = previous_replay;
+    GraphState(request, 1, SnapshotGraph(graph_address));
+    PadTrace::Record("DMC_GUN_REPLAY_END", {static_cast<s64>(request), result});
+    if (native_cache.replay_records == 64) {
+        PadTrace::Record("DMC_NATIVE_LIMIT", {18, 64});
+    }
+    return result;
+}
+
 u32 PS4_SYSV_ABI ObserveGraphEvent(void* graph, void* event) {
-    if (!PadTrace::Enabled() || native_cache.aggregate_request == 0 ||
-        native_cache.handoff_records[1] >= 512) {
+    if (!PadTrace::Enabled()) {
+        return native_graph_event(graph, event);
+    }
+    ResetNativeCache();
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    if ((caller == guest_base + 0xa1f8e3 || caller == guest_base + 0xa1f913) &&
+        native_cache.replay_records < 64 && event != nullptr && native_cache.gun_descriptor != 0 &&
+        IsInputContext(reinterpret_cast<u64>(event)) &&
+        LiveWord(reinterpret_cast<u64>(event) + 0x60) == native_cache.gun_descriptor &&
+        *reinterpret_cast<const u8*>(reinterpret_cast<u64>(event) + 0x78) == 2) {
+        return TraceGunReplay(graph, event, caller);
+    }
+    if (native_cache.aggregate_request == 0 || native_cache.handoff_records[1] >= 512) {
         return native_graph_event(graph, event);
     }
     const auto before = SnapshotGraph(reinterpret_cast<u64>(graph));

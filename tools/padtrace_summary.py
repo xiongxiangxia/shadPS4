@@ -76,6 +76,9 @@ def summarize(path):
     buffer_admissions = []
     gate_metadata = []
     ranged_tokens = []
+    gun_replays = []
+    replay_pending = {}
+    awake_queues = []
     node_exits = []
     fire_hooks = []
     fire_schedules = []
@@ -236,6 +239,7 @@ def summarize(path):
                     "descriptor": hex(p[2]), "type": p[3], "selected_link": hex(p[4]),
                     "condition_count": p[5], "match_count": p[6], "clipped_raw": p[7],
                     "gun_epoch": p[8], "parent": p[9], "caller": hex(p[10]),
+                    "replay_request": p[11],
                 })
             elif kind == "DMC_BUFFER_ADMIT" and len(buffer_admissions) < 256:
                 buffer_admissions.append({
@@ -265,6 +269,30 @@ def summarize(path):
                     "request": p[0], "index": p[1], "condition": hex(p[2]),
                     "function": hex(p[3]), "context": hex(p[4]), "pawn": hex(p[5]),
                     "result": p[6], "caller": hex(p[7]), "function_flags_raw": p[8],
+                })
+            elif kind == "DMC_GUN_REPLAY_BEGIN":
+                item = {
+                    "monotonic_us": timestamp, "thread": row["thread"], "request": p[0],
+                    "caller": hex(p[1]), "graph": hex(p[2]), "event": hex(p[3]),
+                    "descriptor": hex(p[4]), "entry_combo": p[5], "entry_flags_raw": p[6],
+                    "entry_play_mode": p[7], "entry_held_mask": hex(p[8]),
+                    "serial": p[9], "gun_epoch": p[10], "previous_parent": p[11],
+                }
+                if len(gun_replays) < 64:
+                    gun_replays.append(item)
+                    replay_pending[p[0]] = item
+            elif kind == "DMC_GUN_REPLAY_END":
+                item = replay_pending.pop(p[0], None)
+                if item is not None:
+                    item["result_raw"] = p[1]
+                    item["duration_us"] = timestamp - item["monotonic_us"]
+            elif kind == "DMC_AWAKE_QUEUE" and len(awake_queues) < 256:
+                awake_queues.append({
+                    "monotonic_us": timestamp, "thread": row["thread"],
+                    "request": p[0], "phase": p[1], "aggregator": hex(p[2]),
+                    "processing_graph": hex(p[3]), "flags_raw": p[4],
+                    "primary_count": p[5], "secondary_count": p[6],
+                    "pending_count": p[7], "pending_owner": hex(p[8]), "serial": p[9],
                 })
             elif kind == "DMC_RANGED_TOKEN" and len(ranged_tokens) < 128:
                 ranged_tokens.append({
@@ -501,6 +529,8 @@ def summarize(path):
         "dmc_buffer_admissions_first_256": buffer_admissions,
         "dmc_gate_metadata_first_4096": gate_metadata,
         "dmc_ranged_token_snapshots_first_128": ranged_tokens,
+        "dmc_gun_replays_first_64": gun_replays,
+        "dmc_awake_queues_first_256": awake_queues,
         "dmc_node_exits_first_64": node_exits,
         "dmc_fire_hooks": fire_hooks,
         "dmc_fire_schedules_first_2048": fire_schedules,
