@@ -749,6 +749,312 @@ bool NameIs(u32 index, const char* expected) {
     return true;
 }
 
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+Native compat_bool = nullptr;
+std::atomic<bool> compat_enabled{false};
+
+enum class CompatGun { None, Pistols, Shotgun };
+
+struct CompatState {
+    u64 controller = 0;
+    u64 pawn = 0;
+    u64 input = 0;
+    u64 consumed_property = 0;
+    u64 candidate = 0;
+    u64 aggregator = 0;
+    u32 charge_offset = 0;
+    u32 pawn_offset = 0;
+    u32 input_offset = 0;
+    u32 health_offset = 0;
+    u64 controller_class = 0;
+    u32 retries = 0;
+    std::chrono::steady_clock::time_point last_retry{};
+    CompatGun gun = CompatGun::None;
+    bool selecting = false;
+};
+
+thread_local CompatState compat;
+
+bool CompatName(u64 object, const char* name) {
+    return object != 0 && NameIs(static_cast<u32>(Word(object + 0x48)), name);
+}
+
+bool CompatClass(u64 object, const char* name) {
+    for (u64 type = Word(object + 0x50), depth = 0; type != 0 && depth < 32;
+         type = Word(type + 0x68), ++depth) {
+        if (CompatName(type, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+u32 CompatOffset(u64 object, const char* name) {
+    struct CachedOffset {
+        u64 type = 0;
+        const char* name = nullptr;
+        u32 offset = 0;
+    };
+    thread_local std::array<CachedOffset, 256> offsets{};
+    const u64 object_type = Word(object + 0x50);
+    auto& cached =
+        offsets[((object_type >> 4) ^ (reinterpret_cast<u64>(name) >> 3)) % offsets.size()];
+    if (cached.type == object_type && cached.name == name) {
+        return cached.offset;
+    }
+    cached = {object_type, name, 0};
+    for (u64 type = object_type, depth = 0; type != 0 && depth < 32;
+         type = Word(type + 0x68), ++depth) {
+        for (u64 field = Word(type + 0x70), count = 0; field != 0 && count < 2048;
+             field = Word(field + 0x60), ++count) {
+            if (CompatName(field, name)) {
+                u32 offset = 0;
+                if (Read(field + 0x90, &offset, sizeof(offset)) && offset >= 0x58 &&
+                    offset < 0x10000) {
+                    cached.offset = offset;
+                    return cached.offset;
+                }
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+u64 CompatObject(u64 object, const char* name) {
+    const u32 offset = CompatOffset(object, name);
+    return offset != 0 ? Word(object + offset) : 0;
+}
+
+bool CompatHeld() {
+    u32 buttons = 0;
+    return compat.input != 0 && Read(compat.input + 0x220, &buttons, sizeof(buttons)) &&
+           (buttons & (1u << 6)) != 0;
+}
+
+void CompatController(u64 object) {
+    const u64 type = Word(object + 0x50);
+    if (compat.controller_class != type) {
+        compat.controller_class = type;
+        compat.pawn_offset = CompatOffset(object, "m_NTPawn");
+        compat.input_offset = CompatOffset(object, "m_NTInput");
+    }
+    const u64 pawn = compat.pawn_offset != 0 ? Word(object + compat.pawn_offset) : 0;
+    const u64 input = compat.input_offset != 0 ? Word(object + compat.input_offset) : 0;
+    if (compat.controller != object || compat.pawn != pawn || compat.input != input) {
+        compat.gun = CompatGun::None;
+        compat.aggregator = 0;
+        compat.charge_offset = CompatOffset(pawn, "m_fcpGunCharge");
+        compat.health_offset = CompatOffset(pawn, "Health");
+    }
+    compat.controller = object;
+    compat.pawn = pawn;
+    compat.input = input;
+    if (!CompatHeld()) {
+        compat.gun = CompatGun::None;
+    }
+}
+
+bool CompatPending() {
+    if (!CompatHeld()) {
+        compat.gun = CompatGun::None;
+        return false;
+    }
+    s32 health = 0;
+    if (compat.health_offset != 0 &&
+        Read(compat.pawn + compat.health_offset, &health, sizeof(health)) && health <= 0) {
+        compat.gun = CompatGun::None;
+        return false;
+    }
+    u32 charge = 0;
+    return compat.gun != CompatGun::None && compat.pawn != 0 && compat.charge_offset != 0 &&
+           Read(compat.pawn + compat.charge_offset, &charge, sizeof(charge)) && charge == 0;
+}
+
+CompatGun CompatTarget(u64 definition) {
+    const u64 target = CompatObject(definition, "TargetNode");
+    if (CompatName(target, "Node_Dante_Shotgun_Bomb_Charge")) {
+        return CompatGun::Shotgun;
+    }
+    if (CompatName(target, "Node_Dante_EnI_Ricoshot_Charge")) {
+        return CompatGun::Pistols;
+    }
+    return CompatGun::None;
+}
+
+void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
+    if (!compat_enabled) {
+        return compat_bool(object, frame, result);
+    }
+    thread_local bool interpreter_checked = false;
+    if (!interpreter_checked) {
+        const u64 slot = guest_base + 0x3960040 + 0x2d * 16;
+        if (Word(slot) != guest_base + 0x58880 || Word(slot + 8) != 0) {
+            compat_enabled = false;
+            LOG_ERROR(Input, "[DMC COMPAT] Bool opcode mismatch; experiment disabled");
+            return compat_bool(object, frame, result);
+        }
+        interpreter_checked = true;
+    }
+    const u64 code = Operand(frame);
+    const bool instance = *reinterpret_cast<const u8*>(code) == 0x01;
+    const u64 property = instance ? LiveWord(code + 1) : 0;
+    if (property != 0 && compat.consumed_property == 0 &&
+        CompatName(property, "m_ConsumedHeldInput_RangedAttack")) {
+        compat.consumed_property = property;
+    }
+    compat_bool(object, frame, result);
+    if (result == nullptr || property == 0 || property != compat.consumed_property ||
+        !CompatName(Word(reinterpret_cast<u64>(frame) + 0x18), "PlayerTick") ||
+        !CompatClass(reinterpret_cast<u64>(object), "DVPlayerController_Dante")) {
+        return;
+    }
+    CompatController(reinterpret_cast<u64>(object));
+    u32 buffered = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (CompatPending() && compat.aggregator != 0 &&
+        Read(compat.aggregator + 0x80, &buffered, sizeof(buffered)) && buffered == 0 &&
+        now - compat.last_retry >= std::chrono::milliseconds{100}) {
+        u32 consumed = 0;
+        std::memcpy(&consumed, result, sizeof(consumed));
+        if (consumed == 0) {
+            return;
+        }
+        compat.last_retry = now;
+        const u32 retry = 0;
+        std::memcpy(result, &retry, sizeof(retry));
+        if (compat.retries++ == 0) {
+            LOG_INFO(Input, "[DMC COMPAT] Retrying held gun request; gun={}",
+                     static_cast<u32>(compat.gun));
+        }
+    }
+}
+
+void CompatDispatch(void* object, void* function, void* parameters, void* result, u64 caller) {
+    const u64 address = reinterpret_cast<u64>(object);
+    native_condition_dispatch(object, function, parameters, result);
+    if (!compat.selecting || parameters == nullptr || !CompatPending() ||
+        (caller != guest_base + 0xa2090c && caller != guest_base + 0xa235b9) ||
+        Word(reinterpret_cast<u64>(parameters) + 16) != compat.pawn) {
+        return;
+    }
+    const u64 outer = Word(address + 0x40);
+    const bool root_token = CompatName(outer, "RangeAttacksRoot") &&
+                            CompatClass(address, "DVActionGraph_ConditionDef_Token") &&
+                            NameIs(static_cast<u32>(Word(address + 0x60)), "RangedDenied");
+    const bool original_weapon =
+        outer == compat.candidate && outer != 0 &&
+        CompatClass(address, "DVActionGraph_ConditionDef_SelectedRangedWeapon");
+    if (root_token || original_weapon) {
+        const u32 accepted = 1;
+        std::memcpy(static_cast<u8*>(parameters) + 24, &accepted, sizeof(accepted));
+    }
+}
+
+void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
+    if (!compat_enabled) {
+        return original.load(std::memory_order_acquire)(object, frame, result);
+    }
+    struct Site {
+        u64 code = 0;
+        bool shot = false;
+    };
+    thread_local std::array<Site, 512> sites{};
+    const u64 code = Operand(frame);
+    auto& site = sites[(code >> 2) % sites.size()];
+    if (site.code != code) {
+        site = {code, false};
+        const auto* bytes = reinterpret_cast<const u8*>(code);
+        Assignment assignment;
+        site.shot = bytes[0] == 0x19 && bytes[1] == 0x01 && Decode(code, assignment) &&
+                    assignment.value == 0x3f800000 && CompatName(assignment.property, "m_fcpGunOn");
+    }
+    const bool shot = site.shot;
+    original.load(std::memory_order_acquire)(object, frame, result);
+    if (!shot || !compat_enabled) {
+        return;
+    }
+    const u64 address = reinterpret_cast<u64>(object);
+    const auto gun = CompatClass(address, "DVAction_Dante_ShotgunShot")      ? CompatGun::Shotgun
+                     : CompatClass(address, "DVAction_Dante_EbonyIvoryShot") ? CompatGun::Pistols
+                                                                             : CompatGun::None;
+    if (gun == CompatGun::None) {
+        return;
+    }
+    const u64 pawn = CompatObject(address, "m_Dante");
+    const u64 controller = CompatObject(pawn, "Controller");
+    if (controller != 0 && CompatClass(controller, "DVPlayerController_Dante")) {
+        CompatController(controller);
+        if (pawn == compat.pawn && CompatHeld()) {
+            if (compat.gun != gun) {
+                LOG_INFO(Input, "[DMC COMPAT] Normal shot latched; gun={}", static_cast<u32>(gun));
+            }
+            compat.gun = gun;
+            compat.retries = 0;
+        }
+    }
+}
+
+u32 CompatMatch(void* definition, void* event) {
+    if (!compat.selecting) {
+        return native_match_event(definition, event);
+    }
+    const u64 address = reinterpret_cast<u64>(definition);
+    const auto target = CompatTarget(address);
+    if (target == CompatGun::None || target != compat.gun) {
+        compat.candidate = 0;
+        return 0;
+    }
+    auto* mode = static_cast<u8*>(event) + 0x90;
+    const u8 previous_mode = *mode;
+    *mode = 0;
+    const u32 accepted = native_match_event(definition, event);
+    *mode = previous_mode;
+    compat.candidate = accepted != 0 ? address : 0;
+    return accepted;
+}
+
+void* CompatSelect(void* set, void* event) {
+    const bool previous = compat.selecting;
+    const u64 previous_candidate = compat.candidate;
+    const u64 address = reinterpret_cast<u64>(event);
+    compat.selecting = event != nullptr && CompatPending() &&
+                       *reinterpret_cast<const u8*>(address + 0x78) == 2 &&
+                       CompatName(Word(address + 0x60), "DVButton_RangedAttack");
+    if (compat.selecting) {
+        const u64 set_address = reinterpret_cast<u64>(set);
+        const u64 links = Word(set_address + 0x78);
+        u32 count = 0;
+        bool charge_entry = false;
+        if (Read(set_address + 0x80, &count, sizeof(count)) && count <= 256) {
+            for (u32 i = 0; links != 0 && i < count; ++i) {
+                const u64 link = Word(links + i * 8);
+                if (link != 0 && CompatTarget(Word(link + 0x60)) == compat.gun) {
+                    charge_entry = true;
+                    break;
+                }
+            }
+        }
+        compat.selecting = charge_entry;
+    }
+    compat.candidate = 0;
+    void* selected = native_select_link(set, event);
+    compat.selecting = previous;
+    compat.candidate = previous_candidate;
+    return selected;
+}
+
+u32 CompatAggregate(void* object, void* event, u32 input) {
+    const u64 address = reinterpret_cast<u64>(event);
+    if (input != 0 && event != nullptr && CompatHeld() &&
+        *reinterpret_cast<const u8*>(address + 0x78) == 2 &&
+        CompatName(Word(address + 0x60), "DVButton_RangedAttack")) {
+        compat.aggregator = reinterpret_cast<u64>(object);
+    }
+    return native_aggregate_event(object, event, input);
+}
+#endif
+
 void RangedTokenState(u64 request, const ConditionResult& condition) {
     if (native_cache.token_records >= 128) {
         return;
@@ -1254,6 +1560,11 @@ void GateTopology(u64 request, u64 set, u64 descriptor) {
 void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* parameters,
                                            void* result) {
     const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0));
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    if (compat_enabled) {
+        return CompatDispatch(object, function, parameters, result, caller);
+    }
+#endif
     if (caller == guest_base + 0xa2a85c && parameters != nullptr && function != nullptr &&
         PadTrace::Enabled()) {
         ResetNativeCache();
@@ -1331,6 +1642,11 @@ void PS4_SYSV_ABI ObserveConditionDispatch(void* object, void* function, void* p
 }
 
 u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    if (compat_enabled) {
+        return CompatMatch(definition, event);
+    }
+#endif
     auto* trace = active_gate;
     auto* admission = active_admission;
     if (admission != nullptr && admission->event == reinterpret_cast<u64>(event) &&
@@ -1358,6 +1674,11 @@ u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
 }
 
 void* PS4_SYSV_ABI ObserveSelectLink(void* set, void* event) {
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    if (compat_enabled) {
+        return CompatSelect(set, event);
+    }
+#endif
     if (!PadTrace::Enabled() || event == nullptr) {
         return native_select_link(set, event);
     }
@@ -1741,6 +2062,11 @@ u32 AggregateContext(u64 request, void* event) {
 }
 
 u32 PS4_SYSV_ABI ObserveAggregateEvent(void* object, void* event, u32 input) {
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    if (compat_enabled) {
+        return CompatAggregate(object, event, input);
+    }
+#endif
     if (!PadTrace::Enabled() || !AggregateBudget(input != 0 ? 0 : 1)) {
         return native_aggregate_event(object, event, input);
     }
@@ -2005,15 +2331,67 @@ void InstallNative() {
         Common::ElfInfo::Instance().AppVer() != "01.03") {
         return;
     }
+#ifndef ENABLE_DMC_CHARGE_COMPAT
     const char* setting = std::getenv("SHADPS4_DMC_NATIVE");
     if (setting != nullptr && std::strcmp(setting, "0") == 0) {
         return;
     }
+#endif
     const u64 base = MemoryPatcher::g_eboot_address;
     if (base == 0) {
         return;
     }
     guest_base = base;
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    const char* compatibility = std::getenv("SHADPS4_DMC_COMPAT");
+    if (compatibility != nullptr && std::strcmp(compatibility, "0") == 0) {
+        LOG_INFO(Input, "[DMC COMPAT] Disabled by SHADPS4_DMC_COMPAT=0");
+        return;
+    }
+    constexpr std::array<u8, 14> bool_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x56, 0x53,
+                                            0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0xd3};
+    constexpr std::array<u8, 17> compat_dispatch_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
+                                                       0x41, 0x56, 0x41, 0x55, 0x41, 0x54,
+                                                       0x53, 0x48, 0x83, 0xec, 0x58};
+    auto compat_select_bytes = compat_dispatch_bytes;
+    compat_select_bytes.back() = 0x38;
+    auto compat_let_bytes = compat_dispatch_bytes;
+    compat_let_bytes.back() = 0x18;
+    constexpr std::array<u8, 14> compat_match_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                                    0x56, 0x41, 0x54, 0x53, 0x49, 0x89, 0xf7};
+    const auto matches = [](u64 address, const auto& expected) {
+        auto actual = expected;
+        return Read(address, actual.data(), actual.size()) && actual == expected;
+    };
+    if (!matches(base + 0x58880, bool_bytes) || !matches(base + 0x567e0, compat_let_bytes) ||
+        !matches(base + 0xa1f980, compat_let_bytes) ||
+        !matches(base + 0x6d1e0, compat_dispatch_bytes) ||
+        !matches(base + 0xa20850, compat_select_bytes) ||
+        !matches(base + 0xa26420, compat_match_bytes)) {
+        LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
+        return;
+    }
+    native_condition_dispatch = reinterpret_cast<ConditionDispatch>(NativeEntry(
+        base + 0x6d1e0, reinterpret_cast<u64>(&ObserveConditionDispatch), compat_dispatch_bytes));
+    native_match_event = reinterpret_cast<GraphEvent>(
+        NativeEntry(base + 0xa26420, reinterpret_cast<u64>(&ObserveGateMatch), compat_match_bytes));
+    native_select_link = reinterpret_cast<SelectLink>(NativeEntry(
+        base + 0xa20850, reinterpret_cast<u64>(&ObserveSelectLink), compat_select_bytes));
+    native_aggregate_event = reinterpret_cast<AggregateEvent>(NativeEntry(
+        base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), compat_let_bytes));
+    compat_bool = reinterpret_cast<Native>(
+        NativeEntry(base + 0x58880, reinterpret_cast<u64>(&CompatBool), bool_bytes));
+    original.store(reinterpret_cast<Native>(NativeEntry(
+                       base + 0x567e0, reinterpret_cast<u64>(&CompatLet), compat_let_bytes)),
+                   std::memory_order_release);
+    compat_enabled = native_condition_dispatch != nullptr && native_match_event != nullptr &&
+                     native_select_link != nullptr && compat_bool != nullptr &&
+                     native_aggregate_event != nullptr &&
+                     original.load(std::memory_order_acquire) != nullptr;
+    LOG_INFO(Input, "[DMC COMPAT] Experimental held-charge retry enabled={}; no heavy probes",
+             compat_enabled.load());
+    return;
+#endif
     const char* topology_setting = std::getenv("SHADPS4_DMC_TOPOLOGY");
     discover_topology = topology_setting != nullptr && std::strcmp(topology_setting, "1") == 0;
     constexpr char held_name[] = "UNTInputexecIsHeld";
@@ -2115,6 +2493,9 @@ void InstallNative() {
 }
 
 void Install() {
+#ifdef ENABLE_DMC_CHARGE_COMPAT
+    return;
+#endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);
     PadTrace::Record("DMC_NATIVE_HOOK", {native_held != nullptr, native_clear != nullptr});
     PadTrace::Record("DMC_AGG_HOOK",

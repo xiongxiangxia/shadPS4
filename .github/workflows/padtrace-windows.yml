@@ -1,4 +1,4 @@
-name: PADTRACE Windows diagnostics
+name: DmC compatibility and root-cause diagnostics
 
 on:
   push:
@@ -14,7 +14,16 @@ concurrency:
 
 jobs:
   windows:
+    name: Windows ${{ matrix.edition }}
     runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: ROOTCAUSE-diagnostic
+            compatibility: 'OFF'
+          - edition: COMPAT-experimental
+            compatibility: 'ON'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -23,27 +32,26 @@ jobs:
         uses: egor-tensin/vs-shell@v2
         with:
           arch: x64
-      - name: Configure diagnostic and baseline builds
-        run: |
-          cmake -G Ninja -B build-trace -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_PADTRACE=ON
-          cmake -G Ninja -B build-baseline -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_PADTRACE=OFF
-      - name: Build diagnostic executable
-        run: cmake --build build-trace --parallel $env:NUMBER_OF_PROCESSORS
-      - name: Package diagnostic executable
+      - name: Configure release executable
+        run: cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_PADTRACE=ON -DENABLE_DMC_CHARGE_COMPAT=${{ matrix.compatibility }}
+      - name: Build executable
+        run: cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Package executable
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path package\diagnostic -Force
-          Copy-Item build-trace\shadPS4.exe package\diagnostic\shadPS4.exe
-          Copy-Item documents\PADTRACE-v2.md package\diagnostic\PADTRACE-v2.md
-          Copy-Item tools\padtrace_summary.py package\diagnostic\padtrace_summary.py
-          Get-FileHash package\diagnostic\shadPS4.exe -Algorithm SHA256 | Format-List | Out-File package\diagnostic\SHA256.txt
+          New-Item -ItemType Directory -Path package -Force
+          Copy-Item build\shadPS4.exe package\shadPS4.exe
+          Copy-Item documents\DMC-editions.md package\READ-ME-FIRST.md
+          if ('${{ matrix.compatibility }}' -eq 'ON') {
+            Copy-Item tools\dmc-compat-on.cmd package\
+            Copy-Item tools\dmc-compat-off.cmd package\
+          } else {
+            Copy-Item documents\PADTRACE-v2.md package\PADTRACE-v2.md
+            Copy-Item tools\padtrace_summary.py package\padtrace_summary.py
+          }
+          '${{ matrix.edition }} / ${{ github.sha }}' | Out-File package\EDITION.txt
+          Get-FileHash package\shadPS4.exe -Algorithm SHA256 | Format-List | Out-File package\SHA256.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-PADTRACE-v2-windows-${{ github.sha }}
-          path: package/diagnostic/
-      - name: Build baseline executable
-        run: cmake --build build-baseline --parallel $env:NUMBER_OF_PROCESSORS
-      - uses: actions/upload-artifact@v7
-        with:
-          name: shadPS4-PADTRACE-v2-baseline-windows-${{ github.sha }}
-          path: build-baseline/shadPS4.exe
+          name: shadPS4-DMC-${{ matrix.edition }}-windows-${{ github.sha }}
+          path: package/
