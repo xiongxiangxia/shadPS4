@@ -46,6 +46,7 @@ jobs:
             Copy-Item documents\DMC-JC-capture.md package\JC-CAPTURE.md
             Copy-Item tools\dmc-compat-on.cmd package\
             Copy-Item tools\dmc-compat-off.cmd package\
+            Copy-Item tools\dmc-jc-off.cmd package\
           } else {
             Copy-Item documents\PADTRACE-v2.md package\PADTRACE-v2.md
             Copy-Item tools\padtrace_summary.py package\padtrace_summary.py

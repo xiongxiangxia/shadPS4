@@ -1,6 +1,20 @@
 # JC jump-cancel melee capture
 
-This is observation, not a fix for missing melee. Use COMPAT-experimental so the verified gun compatibility changes remain active. ROOTCAUSE-diagnostic retains the older gun-focused probes and does not include this capture. Game files and jump/melee input consumption are not modified.
+COMPAT-experimental now also contains an experimental bounded melee retry for Demon Pull Leap. This is a workaround, not a confirmed emulator root-cause fix. Gun compatibility remains active. ROOTCAUSE-diagnostic does not contain either compatibility change. Game files are not modified.
+
+## Bounded melee retry
+
+Start with F9 off. After a Normal-mode Jump selects the specific Dante_DevilPull.Nodes.DemonPullJump link, a new Normal-mode LightMelee/StrongMelee press may be retained only if the player's aggregate rejects it and the Graph_MeleeRoot MeleeDenied condition was observed rejecting that same live event. The pending slot stores the button descriptor, never the pooled event pointer. The synchronous rejection observer is cleared before returning from the aggregate.
+
+On the existing input-enabled PlayerTick path, use the controller's verified native SendActionGraphEvent implementation to construct a fresh Pressed event. All original melee conditions remain in force. Retry at most once per 16 ms, at most 12 attempts and no longer than 200 ms from rejection; the Leap eligibility itself expires after 400 ms. Stop at the first native acceptance (which may mean buffering, not animation execution). No global token override or Leap removal is added.
+
+Require the same player/pawn/input context, the original Leap node still active in the current player's graph list, Normal mode, positive health and m_fcpInAir. A new Pressed command cancels the old pending slot; a newer eligible melee rejection can replace it. An accepted same-button Pressed/Held event also clears it. Releasing a short tap alone does not cancel an unaccepted press. Context changes, leaving Leap, landing, changing mode, death, expiry, or an unknown native sender discard it. A pause can prevent ticking; elapsed wall time then prevents stale replay on resume. No long-lived event object is retained and no input is inserted into unrelated gameplay states.
+
+The possible visible side effect is a single delayed melee, at most 200 ms after the rejected press. This does not guarantee the same timing/route as a real PS4 JC. It deliberately does not carry the attack beyond Leap; if permission stays closed until Leap exits, it cancels instead of forcing an attack. Runtime performance and effectiveness are not yet verified.
+
+Use dmc-jc-off.cmd to disable only this retry while keeping the working gun compatibility. dmc-compat-on.cmd enables both. SHADPS4_DMC_JC_COMPAT=0 is the independent environment switch; restart to apply. SHADPS4_DMC_COMPAT=0 still disables all compatibility. Ordinary shad_log.txt markers [DMC JC COMPAT] report enabled, retained, accepted, or cancelled; F9 is not required for initial play testing.
+
+## Optional observation
 
 F9 starts/stops capture. Arrive in the test area before starting. Keep each capture short (roughly 5–10 seconds): airborne demon pull, then the usual closely spaced jump followed by melee. Aim to capture one missing-melee attempt and one successful attempt; report the actual order. Do not deliberately change timing for every attempt or assume every attempt failed. Stop with F9 and exit normally; provide the newest padtrace CSV and ordinary shad_log.txt. If capture noticeably changes gameplay, stop and report the disturbance; do not treat its timings as undisturbed evidence.
 

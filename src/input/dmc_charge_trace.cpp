@@ -787,6 +787,24 @@ struct CompatState {
 
 thread_local CompatState compat;
 
+struct JcAssistState {
+    u64 graph = 0;
+    u64 node = 0;
+    u64 descriptor = 0;
+    u64 observing_event = 0;
+    u32 air_offset = 0;
+    u32 attempts = 0;
+    bool denied = false;
+    bool pending = false;
+    bool replaying = false;
+    std::chrono::steady_clock::time_point armed{};
+    std::chrono::steady_clock::time_point deadline{};
+    std::chrono::steady_clock::time_point last_retry{};
+};
+
+thread_local JcAssistState jc_assist;
+std::atomic<bool> jc_assist_enabled{true};
+
 bool CompatRead(u64 address, void* output, std::size_t size);
 u64 CompatWord(u64 address);
 
@@ -1247,6 +1265,7 @@ void CompatController(u64 object) {
         compat.gun = CompatGun::None;
         compat.aggregator = 0;
         compat.mode_held = false;
+        jc_assist = {};
         compat.charge_offset = CompatOffset(pawn, "m_fcpGunCharge");
         compat.health_offset = CompatOffset(pawn, "m_Health");
         compat.mode_offset = CompatOffset(pawn, "m_Playmode");
@@ -1266,6 +1285,124 @@ void CompatController(u64 object) {
         compat.gun = CompatGun::None;
         compat.aggregator = 0;
         compat.mode_held = false;
+    }
+}
+
+bool JcAssistContext() {
+    if (!jc_assist_enabled || compat.pawn == 0 || compat.mode_offset == 0 ||
+        compat.health_offset == 0 || jc_assist.graph == 0 || jc_assist.node == 0 ||
+        std::chrono::steady_clock::now() - jc_assist.armed > std::chrono::milliseconds{400}) {
+        return false;
+    }
+    u8 mode = 255;
+    float health = 0.0f;
+    float in_air = 0.0f;
+    if (jc_assist.air_offset == 0) {
+        jc_assist.air_offset = CompatOffset(compat.pawn, "m_fcpInAir");
+    }
+    if (jc_assist.air_offset == 0 ||
+        !CompatRead(compat.pawn + compat.mode_offset, &mode, sizeof(mode)) || mode != 0 ||
+        !CompatRead(compat.pawn + compat.health_offset, &health, sizeof(health)) ||
+        !(health > 0.0f) ||
+        !CompatRead(compat.pawn + jc_assist.air_offset, &in_air, sizeof(in_air)) ||
+        !(in_air > 0.0f)) {
+        return false;
+    }
+    const u64 aggregator = CompatWord(compat.pawn + 0x930);
+    u32 count = 0;
+    if (aggregator == 0 || !CompatRead(aggregator + 0x68, &count, sizeof(count)) || count > 64) {
+        return false;
+    }
+    const u64 graphs = CompatWord(aggregator + 0x60);
+    for (u32 i = 0; graphs != 0 && i < count; ++i) {
+        if (CompatWord(graphs + i * 8) == jc_assist.graph) {
+            return CompatWord(jc_assist.graph + 0x88) == jc_assist.node;
+        }
+    }
+    return false;
+}
+
+void JcAssistSelected(void* selected, void* event) {
+    if (!jc_assist_enabled || jc_assist.replaying || selected == nullptr || event == nullptr ||
+        compat.pawn == 0) {
+        return;
+    }
+    const u64 address = reinterpret_cast<u64>(event);
+    const u64 descriptor = LiveWord(address + 0x60);
+    if (*reinterpret_cast<const u8*>(address + 0x90) != 0 || descriptor == 0 ||
+        !CompatNameIndex(static_cast<u32>(LiveWord(descriptor + 0x48)), "DVButton_Jump")) {
+        return;
+    }
+    CompatMemoryScope memory{"jc_arm"};
+    const u64 definition = CompatWord(reinterpret_cast<u64>(selected) + 0x60);
+    const u64 target = CompatObject(definition, "TargetNode");
+    const u64 nodes = CompatWord(target + 0x40);
+    if (!CompatName(target, "DemonPullJump") || !CompatName(nodes, "Nodes") ||
+        !CompatName(CompatWord(nodes + 0x40), "Dante_DevilPull")) {
+        return;
+    }
+    const u64 node = CompatWord(reinterpret_cast<u64>(selected) + 0x70);
+    const u64 graph = CompatObject(node, "m_ActionGraph");
+    if (node == 0 || graph == 0) {
+        return;
+    }
+    jc_assist = {};
+    jc_assist.graph = graph;
+    jc_assist.node = node;
+    jc_assist.armed = std::chrono::steady_clock::now();
+    LOG_INFO(Input, "[DMC JC COMPAT] Demon Pull Leap window armed");
+}
+
+void JcAssistCondition(u64 address, void* parameters, u64 caller) {
+    if (jc_assist.observing_event == 0 || parameters == nullptr ||
+        (caller != guest_base + 0xa1fee9 && caller != guest_base + 0xa2090c) ||
+        CompatWord(reinterpret_cast<u64>(parameters)) != jc_assist.observing_event ||
+        CompatWord(reinterpret_cast<u64>(parameters) + 16) != compat.pawn ||
+        LiveDword(reinterpret_cast<u64>(parameters) + 24) != 0) {
+        return;
+    }
+    CompatMemoryScope memory{"jc_denial"};
+    if (CompatName(CompatWord(address + 0x40), "Graph_MeleeRoot") &&
+        CompatClass(address, "DVActionGraph_ConditionDef_Token") &&
+        CompatNameIndex(static_cast<u32>(CompatWord(address + 0x60)), "MeleeDenied")) {
+        jc_assist.denied = true;
+    }
+}
+
+void JcAssistTick() {
+    if (jc_assist.graph != 0 && !jc_assist.pending &&
+        std::chrono::steady_clock::now() - jc_assist.armed > std::chrono::milliseconds{400}) {
+        jc_assist = {};
+    }
+    if (!jc_assist.pending || jc_assist.replaying) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= jc_assist.deadline || jc_assist.attempts >= 12 || !JcAssistContext()) {
+        LOG_INFO(Input, "[DMC JC COMPAT] Pending melee cancelled; attempts={}", jc_assist.attempts);
+        jc_assist.pending = false;
+        return;
+    }
+    if (now - jc_assist.last_retry < std::chrono::milliseconds{16}) {
+        return;
+    }
+    const u64 target = CompatWord(CompatWord(compat.controller) + 0xa90);
+    if (target != guest_base + 0xb0d510 && target != guest_base + 0xb0d910) {
+        jc_assist.pending = false;
+        LOG_WARNING(Input, "[DMC JC COMPAT] Unknown event sender; retry cancelled");
+        return;
+    }
+    using SendEvent = u32(PS4_SYSV_ABI*)(void*, void*, u32);
+    jc_assist.replaying = true;
+    jc_assist.last_retry = now;
+    ++jc_assist.attempts;
+    const u32 accepted =
+        reinterpret_cast<SendEvent>(target)(reinterpret_cast<void*>(compat.controller),
+                                            reinterpret_cast<void*>(jc_assist.descriptor), 0);
+    jc_assist.replaying = false;
+    if (accepted != 0) {
+        jc_assist.pending = false;
+        LOG_INFO(Input, "[DMC JC COMPAT] Retried melee accepted; attempts={}", jc_assist.attempts);
     }
 }
 
@@ -1450,6 +1587,7 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     CompatMemoryScope memory{"tick"};
     CompatController(reinterpret_cast<u64>(object));
     CompatModeIntent();
+    JcAssistTick();
     if (compat.gun == CompatGun::None) {
         return;
     }
@@ -1497,6 +1635,7 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
 void CompatDispatch(void* object, void* function, void* parameters, void* result, u64 caller) {
     const u64 address = reinterpret_cast<u64>(object);
     native_condition_dispatch(object, function, parameters, result);
+    JcAssistCondition(address, parameters, caller);
     if (jc.active != 0 && function != nullptr && caller >= guest_base + 0xa18780 &&
         caller < guest_base + 0xa18a00 && JcBudget()) {
         PadTrace::Record("JC_LIFECYCLE",
@@ -1688,7 +1827,9 @@ void* CompatSelect(void* set, void* event) {
     if (event == nullptr || compat.gun == CompatGun::None || compat.gun_descriptor == 0 ||
         LiveWord(address + 0x60) != compat.gun_descriptor ||
         *reinterpret_cast<const u8*>(address + 0x78) != 2) {
-        return native_select_link(set, event);
+        void* selected = native_select_link(set, event);
+        JcAssistSelected(selected, event);
+        return selected;
     }
     CompatMemoryScope memory{"select"};
     compat.selecting = CompatPending();
@@ -1719,6 +1860,28 @@ void* CompatSelect(void* set, void* event) {
 
 u32 CompatAggregate(void* object, void* event, u32 input) {
     const u64 address = reinterpret_cast<u64>(event);
+    bool observe_melee = false;
+    u64 descriptor = 0;
+    u8 event_type = 255;
+    if (jc_assist_enabled && jc_assist.graph != 0 && !jc_assist.replaying && event != nullptr &&
+        compat.pawn != 0) {
+        CompatMemoryScope memory{"jc_offer"};
+        const bool player = reinterpret_cast<u64>(object) == CompatWord(compat.pawn + 0x930);
+        event_type = *reinterpret_cast<const u8*>(address + 0x78);
+        descriptor = LiveWord(address + 0x60);
+        if (player && input != 0 && event_type == 0) {
+            jc_assist.pending = false;
+            observe_melee = (CompatName(descriptor, "DVButton_LightMelee") ||
+                             CompatName(descriptor, "DVButton_StrongMelee")) &&
+                            *reinterpret_cast<const u8*>(address + 0x90) == 0 && JcAssistContext();
+        } else if (!player) {
+            descriptor = 0;
+        }
+    }
+    const u64 previous_event = jc_assist.observing_event;
+    const bool previous_denied = jc_assist.denied;
+    jc_assist.observing_event = observe_melee ? address : 0;
+    jc_assist.denied = false;
     if (input != 0 && event != nullptr && (compat.gun != CompatGun::None || compat.mode_held) &&
         *reinterpret_cast<const u8*>(address + 0x78) == 2) {
         CompatMemoryScope memory{"aggregate"};
@@ -1731,7 +1894,25 @@ u32 CompatAggregate(void* object, void* event, u32 input) {
             compat.aggregator = reinterpret_cast<u64>(object);
         }
     }
-    return native_aggregate_event(object, event, input);
+    const u32 accepted = native_aggregate_event(object, event, input);
+    const bool denied = jc_assist.denied;
+    jc_assist.observing_event = previous_event;
+    jc_assist.denied = previous_denied;
+    if (observe_melee && accepted == 0 && denied) {
+        CompatMemoryScope memory{"jc_retain"};
+        if (JcAssistContext()) {
+            jc_assist.descriptor = descriptor;
+            jc_assist.pending = true;
+            jc_assist.attempts = 0;
+            jc_assist.last_retry = std::chrono::steady_clock::now();
+            jc_assist.deadline = jc_assist.last_retry + std::chrono::milliseconds{200};
+            LOG_INFO(Input, "[DMC JC COMPAT] Retained one rejected melee during Demon Pull Leap");
+        }
+    } else if (accepted != 0 && (event_type == 0 || event_type == 2) && descriptor != 0 &&
+               descriptor == jc_assist.descriptor) {
+        jc_assist.pending = false;
+    }
+    return accepted;
 }
 #endif
 
@@ -3088,6 +3269,19 @@ void InstallNative() {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
     }
+    constexpr std::array<u8, 17> sender_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                              0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
+    constexpr std::array<u8, 14> dante_sender_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                                    0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+    auto creator_bytes = sender_bytes;
+    creator_bytes.back() = 0x48;
+    const char* jc_setting = std::getenv("SHADPS4_DMC_JC_COMPAT");
+    jc_assist_enabled = (jc_setting == nullptr || std::strcmp(jc_setting, "0") != 0) &&
+                        matches(base + 0xb0d510, sender_bytes) &&
+                        matches(base + 0xb0d910, dante_sender_bytes) &&
+                        matches(base + 0xb0c170, creator_bytes);
+    LOG_INFO(Input, "[DMC JC COMPAT] Bounded Demon Pull Leap melee retry enabled={}",
+             jc_assist_enabled.load());
     native_condition_dispatch = reinterpret_cast<ConditionDispatch>(NativeEntry(
         base + 0x6d1e0, reinterpret_cast<u64>(&ObserveConditionDispatch), compat_dispatch_bytes));
     native_match_event = reinterpret_cast<GraphEvent>(
