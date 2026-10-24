@@ -1,5 +1,23 @@
 # JC jump-cancel melee capture
 
+## Current GunSpecial investigation
+
+The gameplay compatibility remains the 2a33477b behavior, including the safe live-copy performance change. This revision only adds F9 observations for DVButton_GunSpecial, kind 5 in JC_BEGIN. GunSpecial Pressed and Released events are traced; other recorded buttons remain Pressed-only, with the previous sparse JumpHeld observation. Aggregate acceptance is not proof of animation execution. Replayed GunSpecial events are captured through the existing graph handler and identified by their caller, without another hook or event query.
+
+Format 6 adds bounded GS_STATE before/after the current player's GunSpecial aggregate, plus GS_NODE before/after graph handling. They report the current gun charge flag, physical input, mode, selected weapon, compatibility intent/retry count, buffered inputs, and active action/definition identities. All Token conditions encountered inside GunSpecial scopes may produce the existing JC_TOKEN_STATE counters/owners, not only MeleeDenied/EnemyStepDenied. The supported CUSA01022/01.03 NTPawn token-manager field +0x9c0 is checked against the NTTokenManager class. GunSpecial snapshots skip the old scan for DemonPull actions and timing configuration.
+
+The existing PlayerTick observation may follow a GunSpecial aggregate for at most 400 ms, once per 50 ms at most. A newer GunSpecial replaces the watch. It validates the same player/aggregate and checks that the graph is still in the player's bounded graph array before reading it. It retains no pooled event pointers and calls no game operation. If this PlayerTick expression is not reached, follow-up rows may be absent; absence is not evidence that no action ran. Lifecycle records remain limited to calls made while a tracked event scope is active.
+
+Limits per capture: 64 GS_STATE rows, 128 GS_NODE rows, 32 total token snapshots shared with older observations, 8 buffered events per state, at most 64 advertised buffered events, at most 32 graphs for follow-up validation. Limit markers are GS_STATE_LIMIT, GS_NODE_LIMIT, JC_STATE_LIMIT and the shared JC_LIMIT at 4096 records. No global animation or per-frame all-token scan is added. Cold class/field/name resolution and recording can still perturb timing; zero overhead is not claimed.
+
+GS_STATE fields: request, phase (0 before / 1 after aggregate / 2 follow-up), aggregate, pawn, valid_mask, charge_float_bits, physical_buttons, game_mode, selected_weapon, compatibility_gun, retry_count, buffer_count, buffer_capacity, buffer_owner, buffer_policy, sampled_events, truncated, compatibility_milestones. Valid bits 1 charge, 2 buttons, 4 mode, 8 weapon, 16 buffer header, 32 complete sampled event-pointer array. A zero value without its valid bit is unknown. Milestones are the existing per-intent compatibility log flags, not game-state flags.
+
+GS_BUFFER_ITEM fields: request, phase, index, event, readable, descriptor, combo, flags, event_type. Only the current safe snapshot is read; the event address is never saved for later use. GS_NODE fields: request, phase, graph, node, current_action, action_definition, state_readable, node_state, combo_window. Definition is read only for NTActionGraph_ActionNode instances. A selected link/definition does not prove a visible animation began.
+
+GS_CONDITION pairs with JC_CONDITION by request and condition object: request, condition, readable, raw_config_word_0, raw_config_word_1. These are the condition's first 16 configuration bytes, not universal booleans or timings; interpret only after identifying the actual class and property layout. They allow checking requested mode/weapon/token polarity without a new reflection scan.
+
+Recommended short capture: prepare level-3 charge, start F9 before releasing; release and press GunSpecial without re-holding gun once as the successful control. Then prepare another charge, release, immediately hold gun again, and press GunSpecial once. Leave about half a second after the last attempt, release all keys, stop F9. Report actual outcomes; no unmodified-game capture is required. Do not spam GunSpecial in the first comparison, since repeated inputs could hide a rejected first press.
+
 The current COMPAT-experimental investigation build disables the JC melee retry unconditionally, including when an old launcher sets SHADPS4_DMC_JC_COMPAT=1. Gun compatibility and F9 JC diagnostics remain active. Game files are not modified. The previous retry implementation remains dormant for possible future work; the historical section below is not the behavior of this build. ROOTCAUSE-diagnostic retains the older gun probes and does not include the new JC snapshots.
 
 ## Previous bounded melee retry (disabled in this build)

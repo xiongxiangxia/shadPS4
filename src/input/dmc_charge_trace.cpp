@@ -1014,6 +1014,14 @@ struct JcCapture {
     u64 descriptor = 0;
     u32 records = 0;
     u32 token_snapshots = 0;
+    u32 gun_states = 0;
+    u32 gun_nodes = 0;
+    u64 gun_request = 0;
+    u64 gun_graph = 0;
+    u64 gun_pawn = 0;
+    u64 gun_aggregator = 0;
+    std::chrono::steady_clock::time_point gun_until{};
+    std::chrono::steady_clock::time_point gun_recorded{};
     u32 reel_records = 0;
     u64 reel_action = 0;
     u64 reel_controller = 0;
@@ -1099,6 +1107,9 @@ void JcIdentity(u64 object) {
     JcName(static_cast<u32>(class_name));
 }
 
+void JcGunState(u64 request, u32 phase, u64 aggregator);
+void JcGunNode(u64 request, u32 phase, u64 graph, u64 node);
+
 struct JcScope {
     u64 request = 0;
     u64 previous = 0;
@@ -1141,13 +1152,14 @@ struct JcScope {
                          : CompatNameIndex(name, "DVButton_LightMelee")   ? 2
                          : CompatNameIndex(name, "DVButton_StrongMelee")  ? 3
                          : CompatNameIndex(name, "DVButton_RangedAttack") ? 4
+                         : CompatNameIndex(name, "DVButton_GunSpecial")   ? 5
                                                                           : 0;
         const u8 type = *reinterpret_cast<const u8*>(address + 0x78);
         held_jump = kind == 1 && type == 2 && stage == 0;
         if (held_jump) {
             before_node = LiveWord(object + 0x88);
         }
-        if (kind == 0 || type != 0 || !JcBudget()) {
+        if (kind == 0 || (type != 0 && !(kind == 5 && type == 1)) || !JcBudget()) {
             return;
         }
         request = PadTrace::NextId();
@@ -1166,6 +1178,8 @@ struct JcScope {
                           static_cast<s64>(compat.input), static_cast<s64>(caller - guest_base)});
         if (stage == 0) {
             Node(0);
+        } else if (stage == 1 && kind == 5) {
+            JcGunState(request, 0, this->object);
         }
     }
 
@@ -1175,6 +1189,9 @@ struct JcScope {
             PadTrace::Record("JC_ACTIVE", {static_cast<s64>(request), phase,
                                            static_cast<s64>(object), static_cast<s64>(node)});
             JcIdentity(node);
+            if (jc.kind == 5 && node != 0) {
+                JcGunNode(request, phase, object, node);
+            }
         }
     }
 
@@ -1201,6 +1218,11 @@ struct JcScope {
                              {static_cast<s64>(request), stage, static_cast<s64>(result)});
             if (stage == 0) {
                 Node(1);
+                if (jc.kind == 5 && result != 0) {
+                    jc.gun_graph = object;
+                }
+            } else if (stage == 1 && jc.kind == 5) {
+                JcGunState(request, 1, object);
             } else if (stage == 2 && result != 0) {
                 const u64 definition = CompatWord(result + 0x60);
                 JcIdentity(definition);
@@ -1265,6 +1287,146 @@ u64 CompatObject(u64 object, const char* name) {
 
 u64 JcScope::CompatObjectTarget(u64 definition) {
     return definition != 0 ? CompatObject(definition, "TargetNode") : 0;
+}
+
+void JcGunState(u64 request, u32 phase, u64 aggregator) {
+    if (jc.gun_states >= 64 || compat.pawn == 0 || !JcBudget()) {
+        return;
+    }
+    if (CompatWord(compat.pawn + 0x930) != aggregator) {
+        return;
+    }
+    if (phase == 0) {
+        if (jc.gun_pawn != compat.pawn || jc.gun_aggregator != aggregator) {
+            jc.gun_graph = 0;
+        }
+        jc.gun_request = request;
+        jc.gun_pawn = compat.pawn;
+        jc.gun_aggregator = aggregator;
+        jc.gun_recorded = std::chrono::steady_clock::now();
+        jc.gun_until = jc.gun_recorded + std::chrono::milliseconds{400};
+    }
+    ++jc.gun_states;
+    u32 charge = 0;
+    u32 buttons = 0;
+    u8 mode = 0xff;
+    u8 weapon = 0xff;
+    u32 valid = 0;
+    if (compat.charge_offset != 0 &&
+        CompatRead(compat.pawn + compat.charge_offset, &charge, sizeof(charge))) {
+        valid |= 1;
+    }
+    if (compat.input != 0 && CompatRead(compat.input + 0x220, &buttons, sizeof(buttons))) {
+        valid |= 2;
+    }
+    if (compat.mode_offset != 0 &&
+        CompatRead(compat.pawn + compat.mode_offset, &mode, sizeof(mode))) {
+        valid |= 4;
+    }
+    if (compat.weapon_offset != 0 &&
+        CompatRead(compat.pawn + compat.weapon_offset, &weapon, sizeof(weapon))) {
+        valid |= 8;
+    }
+    std::array<u64, 6> header{};
+    const bool buffer_valid = CompatRead(aggregator + 0x78, header.data(), sizeof(header));
+    const u32 count = static_cast<u32>(header[1]);
+    const u32 capacity = static_cast<u32>(header[1] >> 32);
+    if (buffer_valid) {
+        valid |= 16;
+    }
+    std::array<u64, 8> events{};
+    const u32 wanted = std::min<u32>(count, events.size());
+    const bool readable =
+        buffer_valid && count <= 64 && capacity >= count &&
+        (wanted == 0 || (header[0] != 0 && CompatRead(header[0], events.data(), wanted * 8)));
+    if (readable) {
+        valid |= 32;
+    }
+    PadTrace::Record("GS_STATE",
+                     {static_cast<s64>(request), phase, static_cast<s64>(aggregator),
+                      static_cast<s64>(compat.pawn), valid, charge, buttons, mode, weapon,
+                      static_cast<u32>(compat.gun), compat.retries, count, capacity,
+                      static_cast<s64>(header[5]), static_cast<u32>(header[2]),
+                      readable ? wanted : 0, count > events.size(), compat.milestones});
+    if (buffer_valid) {
+        JcIdentity(header[5]);
+    }
+    for (u32 i = 0; readable && i < wanted && JcBudget(); ++i) {
+        std::array<u64, 4> event{};
+        const bool event_valid =
+            events[i] != 0 && CompatRead(events[i] + 0x60, event.data(), sizeof(event));
+        PadTrace::Record("GS_BUFFER_ITEM",
+                         {static_cast<s64>(request), phase, i, static_cast<s64>(events[i]),
+                          event_valid, static_cast<s64>(event[0]), static_cast<u32>(event[1]),
+                          static_cast<u32>(event[1] >> 32), static_cast<u8>(event[3])});
+        if (event_valid) {
+            JcIdentity(event[0]);
+        }
+    }
+    if (jc.gun_states == 64) {
+        PadTrace::Record("GS_STATE_LIMIT", {64});
+    }
+}
+
+void JcGunNode(u64 request, u32 phase, u64 graph, u64 node) {
+    if (jc.gun_nodes >= 128 || !JcBudget()) {
+        return;
+    }
+    ++jc.gun_nodes;
+    const u64 action = CompatWord(node + 0x78);
+    const u64 definition =
+        CompatClass(node, "NTActionGraph_ActionNode") ? CompatObject(node, "m_ActionDef") : 0;
+    u32 state = 0;
+    u32 combo = 0;
+    const bool readable = CompatRead(node + 0xd0, &state, sizeof(state)) &&
+                          CompatRead(node + 0xd4, &combo, sizeof(combo));
+    PadTrace::Record("GS_NODE", {static_cast<s64>(request), phase, static_cast<s64>(graph),
+                                 static_cast<s64>(node), static_cast<s64>(action),
+                                 static_cast<s64>(definition), readable, state, combo});
+    JcIdentity(action);
+    JcIdentity(definition);
+    if (jc.gun_nodes == 128) {
+        PadTrace::Record("GS_NODE_LIMIT", {128});
+    }
+}
+
+void JcGunFollowup() {
+    if (!PadTrace::Enabled() || jc.gun_request == 0 || jc.gun_states >= 64 ||
+        jc.generation != jc_generation.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= jc.gun_until || compat.pawn != jc.gun_pawn ||
+        now - jc.gun_recorded < std::chrono::milliseconds{50}) {
+        return;
+    }
+    CompatMemoryScope memory{"gs_followup"};
+    if (CompatWord(compat.pawn + 0x930) != jc.gun_aggregator) {
+        jc.gun_request = 0;
+        return;
+    }
+    jc.gun_recorded = now;
+    JcGunState(jc.gun_request, 2, jc.gun_aggregator);
+    if (jc.gun_graph == 0 || jc.gun_nodes >= 128) {
+        return;
+    }
+    std::array<u64, 32> graphs{};
+    u32 count = 0;
+    if (!CompatRead(jc.gun_aggregator + 0x68, &count, sizeof(count)) || count > graphs.size()) {
+        return;
+    }
+    const u64 list = CompatWord(jc.gun_aggregator + 0x60);
+    if (count == 0 || list == 0 || !CompatRead(list, graphs.data(), count * sizeof(u64))) {
+        return;
+    }
+    if (std::find(graphs.begin(), graphs.begin() + count, jc.gun_graph) == graphs.begin() + count) {
+        jc.gun_graph = 0;
+        return;
+    }
+    const u64 node = CompatWord(jc.gun_graph + 0x88);
+    if (node != 0) {
+        JcGunNode(jc.gun_request, 2, jc.gun_graph, node);
+    }
 }
 
 bool CompatHeld() {
@@ -1402,8 +1564,8 @@ void JcAssistCondition(u64 address, void* parameters, u64 caller) {
 }
 
 void JcTokenSnapshot(u64 condition, u64 pawn, u64 token) {
-    if (jc.token_snapshots >= 32 || pawn == 0 ||
-        (!CompatNameIndex(static_cast<u32>(token), "MeleeDenied") &&
+    if (jc.token_snapshots >= 32 || pawn == 0 || (jc.kind == 5 && pawn != compat.pawn) ||
+        (jc.kind != 5 && !CompatNameIndex(static_cast<u32>(token), "MeleeDenied") &&
          !CompatNameIndex(static_cast<u32>(token), "EnemyStepDenied")) ||
         !JcBudget()) {
         return;
@@ -1413,7 +1575,8 @@ void JcTokenSnapshot(u64 condition, u64 pawn, u64 token) {
     if (jc.token_snapshots == 32) {
         PadTrace::Record("JC_STATE_LIMIT", {32});
     }
-    const u64 manager = CompatObject(pawn, "m_TokenManager");
+    const u64 manager =
+        jc.kind == 5 ? CompatWord(pawn + 0x9c0) : CompatObject(pawn, "m_TokenManager");
     std::array<u64, 10> header{};
     std::array<u64, 8> owners{};
     u32 count = 0;
@@ -1480,6 +1643,9 @@ void JcTokenSnapshot(u64 condition, u64 pawn, u64 token) {
          static_cast<s64>(owners[5]), static_cast<s64>(owners[6]), static_cast<s64>(owners[7])});
     for (u32 i = 0; i < sampled; ++i) {
         JcName(static_cast<u32>(owners[i]));
+    }
+    if (jc.kind == 5) {
+        return;
     }
     const u64 aggregator = CompatWord(pawn + 0x930);
     u32 graphs_count = 0;
@@ -1943,6 +2109,7 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     CompatMemoryScope memory{"tick"};
     CompatController(reinterpret_cast<u64>(object));
     CompatModeIntent();
+    JcGunFollowup();
     JcAssistTick();
     if (compat.gun == CompatGun::None) {
         return;
@@ -2012,6 +2179,15 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
                           LiveDword(reinterpret_cast<u64>(parameters) + 24)});
         JcIdentity(address);
         JcIdentity(CompatWord(address + 0x40));
+        if (jc.kind == 5 && JcBudget()) {
+            std::array<u64, 2> configuration{};
+            const bool readable =
+                CompatRead(address + 0x60, configuration.data(), sizeof(configuration));
+            PadTrace::Record("GS_CONDITION",
+                             {static_cast<s64>(jc.active), static_cast<s64>(address), readable,
+                              static_cast<s64>(configuration[0]),
+                              static_cast<s64>(configuration[1])});
+        }
         if (CompatClass(address, "DVActionGraph_ConditionDef_Token")) {
             const u64 token = CompatWord(address + 0x60);
             PadTrace::Record("JC_TOKEN", {static_cast<s64>(jc.active), static_cast<s64>(address),
@@ -3768,8 +3944,9 @@ void InstallNative() {
 void Install() {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     jc_generation.fetch_add(1, std::memory_order_relaxed);
-    PadTrace::Record("JC_CAPTURE", {5, 4096, 128, compat_enabled.load(), 512, 32,
-                                    jc_assist_enabled.load(), native_reel_query != nullptr, 64});
+    PadTrace::Record("JC_CAPTURE",
+                     {6, 4096, 128, compat_enabled.load(), 512, 32, jc_assist_enabled.load(),
+                      native_reel_query != nullptr, 64, 64, 128});
     return;
 #endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);
