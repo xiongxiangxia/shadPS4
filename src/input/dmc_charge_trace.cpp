@@ -994,6 +994,8 @@ struct JcCapture {
     u32 token_snapshots = 0;
     u32 reel_records = 0;
     u64 reel_action = 0;
+    u64 reel_controller = 0;
+    u64 reel_pawn = 0;
     u32 reel_queries = 0;
     u32 reel_result = 0;
     std::chrono::steady_clock::time_point reel_recorded{};
@@ -1055,6 +1057,7 @@ void JcIdentity(u64 object) {
     if (object == 0 || !PadTrace::Enabled() || jc.objects.size() >= 512) {
         return;
     }
+    CompatMemoryScope memory{"jc_identity"};
     const u64 name = CompatWord(object + 0x48);
     const u64 type = CompatWord(object + 0x50);
     const std::array<u64, 2> identity{name, type};
@@ -1383,6 +1386,7 @@ void JcTokenSnapshot(u64 condition, u64 pawn, u64 token) {
         !JcBudget()) {
         return;
     }
+    CompatMemoryScope memory{"jc_token_snapshot"};
     ++jc.token_snapshots;
     if (jc.token_snapshots == 32) {
         PadTrace::Record("JC_STATE_LIMIT", {32});
@@ -1571,23 +1575,28 @@ void PS4_SYSV_ABI ObserveReelQuery(void* object, void* frame, void* result) {
         return;
     }
     const u64 action = LiveWord(reinterpret_cast<u64>(frame) + 0x20);
+    const u32 accepted = LiveDword(reinterpret_cast<u64>(result));
+    const bool same_context = jc.reel_queries != 0 && jc.reel_action == action &&
+                              jc.reel_controller == reinterpret_cast<u64>(object) &&
+                              jc.reel_pawn == compat.pawn;
+    if (same_context && accepted == jc.reel_result &&
+        queried - jc.reel_recorded < std::chrono::milliseconds{50}) {
+        ++jc.reel_queries;
+        return;
+    }
     CompatMemoryScope memory{"jc_reel_query"};
     if (!CompatClass(action, "DVAction_Dante_DemonPull_ReelIn") || compat.pawn == 0 ||
         CompatObject(action, "m_Dante") != compat.pawn ||
         CompatObject(action, "m_MorphemeControl") != reinterpret_cast<u64>(object)) {
         return;
     }
-    const u32 accepted = LiveDword(reinterpret_cast<u64>(result));
-    const bool first = jc.reel_action != action || jc.reel_queries == 0;
-    if (first) {
+    if (!same_context) {
         jc.reel_action = action;
+        jc.reel_controller = reinterpret_cast<u64>(object);
+        jc.reel_pawn = compat.pawn;
         jc.reel_queries = 0;
     }
     ++jc.reel_queries;
-    if (!first && accepted == jc.reel_result &&
-        queried - jc.reel_recorded < std::chrono::milliseconds{50}) {
-        return;
-    }
     jc.reel_result = accepted;
     jc.reel_recorded = queried;
     ++jc.reel_records;
