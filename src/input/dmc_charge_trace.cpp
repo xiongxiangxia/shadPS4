@@ -990,6 +990,7 @@ struct JcCapture {
     u32 kind = 0;
     u64 descriptor = 0;
     u32 records = 0;
+    u32 token_snapshots = 0;
     std::unordered_map<u32, bool> names;
     std::unordered_map<u64, std::array<u64, 2>> objects;
     std::unordered_map<u64, std::array<u64, 2>> held_graphs;
@@ -1369,6 +1370,122 @@ void JcAssistCondition(u64 address, void* parameters, u64 caller) {
     }
 }
 
+void JcTokenSnapshot(u64 condition, u64 pawn, u64 token) {
+    if (jc.token_snapshots >= 32 || pawn == 0 ||
+        (!CompatNameIndex(static_cast<u32>(token), "MeleeDenied") &&
+         !CompatNameIndex(static_cast<u32>(token), "EnemyStepDenied")) ||
+        !JcBudget()) {
+        return;
+    }
+    ++jc.token_snapshots;
+    if (jc.token_snapshots == 32) {
+        PadTrace::Record("JC_STATE_LIMIT", {32});
+    }
+    const u64 manager = CompatObject(pawn, "m_TokenManager");
+    std::array<u64, 10> header{};
+    std::array<u64, 8> owners{};
+    u32 count = 0;
+    u32 owner_count = 0;
+    u32 sampled = 0;
+    u32 steps = 0;
+    u32 flags = 0;
+    const u32 status = [&]() -> u32 {
+        if (manager == 0 || !CompatClass(manager, "NTTokenManager") ||
+            !CompatRead(manager + 0x60, header.data(), sizeof(header))) {
+            return 3;
+        }
+        const u32 buckets = static_cast<u32>(header[9]);
+        if (buckets == 0) {
+            return 2;
+        }
+        if (buckets > 65536 || (buckets & (buckets - 1)) != 0 || (header[8] == 0 && buckets > 2)) {
+            return 4;
+        }
+        const u64 hash = header[8] != 0 ? header[8] : manager + 0x98;
+        if (hash > std::numeric_limits<u64>::max() - 65536 * 4) {
+            return 4;
+        }
+        s32 index = -1;
+        if (!CompatRead(hash + (static_cast<u32>(token) & (buckets - 1)) * 4, &index,
+                        sizeof(index))) {
+            return 3;
+        }
+        for (; index != -1 && steps < 16; ++steps) {
+            if (index < 0 || index >= 4096 || header[0] == 0 ||
+                header[0] > std::numeric_limits<u64>::max() - 4096 * 0x50) {
+                return 4;
+            }
+            std::array<u64, 10> entry{};
+            if (!CompatRead(header[0] + static_cast<u64>(index) * 0x50, entry.data(),
+                            sizeof(entry))) {
+                return 3;
+            }
+            if (entry[0] == token) {
+                count = static_cast<u32>(entry[2]);
+                owner_count = static_cast<u32>(entry[4]);
+                if (owner_count > 4096 || static_cast<u32>(entry[4] >> 32) < owner_count) {
+                    return 4;
+                }
+                const u32 wanted = std::min<u32>(owner_count, owners.size());
+                flags = owner_count > owners.size() ? 1 : 0;
+                if (wanted != 0 && !CompatRead(entry[3], owners.data(), wanted * sizeof(u64))) {
+                    flags |= 2;
+                } else {
+                    sampled = wanted;
+                }
+                return 1;
+            }
+            index = static_cast<s32>(entry[9]);
+        }
+        return index == -1 ? 2 : 5;
+    }();
+    PadTrace::Record(
+        "JC_TOKEN_STATE",
+        {static_cast<s64>(jc.active), static_cast<s64>(condition), static_cast<s64>(pawn),
+         static_cast<s64>(manager), static_cast<s64>(token), status, count, owner_count, sampled,
+         flags, steps, static_cast<s64>(owners[0]), static_cast<s64>(owners[1]),
+         static_cast<s64>(owners[2]), static_cast<s64>(owners[3]), static_cast<s64>(owners[4]),
+         static_cast<s64>(owners[5]), static_cast<s64>(owners[6]), static_cast<s64>(owners[7])});
+    for (u32 i = 0; i < sampled; ++i) {
+        JcName(static_cast<u32>(owners[i]));
+    }
+    const u64 aggregator = CompatWord(pawn + 0x930);
+    u32 graphs_count = 0;
+    if (aggregator == 0 || !CompatRead(aggregator + 0x68, &graphs_count, sizeof(graphs_count)) ||
+        graphs_count > 32) {
+        return;
+    }
+    const u64 graphs = CompatWord(aggregator + 0x60);
+    u32 actions = 0;
+    for (u32 i = 0; graphs != 0 && i < graphs_count && actions < 2; ++i) {
+        const u64 graph = CompatWord(graphs + i * 8);
+        const u64 node = graph != 0 ? CompatWord(graph + 0x88) : 0;
+        const u64 action = CompatObject(node, "m_CurrentAction");
+        const u64 type = action != 0 ? CompatWord(action + 0x50) : 0;
+        if (!CompatName(type, "DVAction_Dante_DemonPull_ReelIn") &&
+            !CompatName(type, "DVAction_Dante_DemonPull_Jump") &&
+            !CompatName(type, "DVAction_Dante_DemonPull_Deflect")) {
+            continue;
+        }
+        ++actions;
+        if (!JcBudget()) {
+            break;
+        }
+        const u32 offset = CompatOffset(action, "m_RunTime");
+        u32 runtime = 0;
+        const bool readable = offset != 0 && CompatRead(action + offset, &runtime, sizeof(runtime));
+        const u64 timeline = CompatWord(action + 0x60);
+        u32 timeline_time = 0;
+        const bool timeline_readable =
+            timeline != 0 && CompatRead(timeline + 0x8c, &timeline_time, sizeof(timeline_time));
+        PadTrace::Record("JC_ACTION_CLOCK",
+                         {static_cast<s64>(jc.active), static_cast<s64>(graph),
+                          static_cast<s64>(node), static_cast<s64>(action), readable, runtime,
+                          static_cast<s64>(timeline), timeline_readable, timeline_time});
+        JcIdentity(action);
+    }
+}
+
 void JcAssistTick() {
     if (jc_assist.graph != 0 && !jc_assist.pending &&
         std::chrono::steady_clock::now() - jc_assist.armed > std::chrono::milliseconds{400}) {
@@ -1661,6 +1778,7 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
             PadTrace::Record("JC_TOKEN", {static_cast<s64>(jc.active), static_cast<s64>(address),
                                           static_cast<s64>(token)});
             JcName(static_cast<u32>(token));
+            JcTokenSnapshot(address, LiveWord(reinterpret_cast<u64>(parameters) + 16), token);
         }
     }
     const bool graph_condition = caller == guest_base + 0xa1fee9;
@@ -3410,7 +3528,8 @@ void InstallNative() {
 void Install() {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     jc_generation.fetch_add(1, std::memory_order_relaxed);
-    PadTrace::Record("JC_CAPTURE", {2, 4096, 128, compat_enabled.load(), 512});
+    PadTrace::Record("JC_CAPTURE",
+                     {3, 4096, 128, compat_enabled.load(), 512, 32, jc_assist_enabled.load()});
     return;
 #endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);
