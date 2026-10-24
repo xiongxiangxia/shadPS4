@@ -804,6 +804,7 @@ struct JcAssistState {
 
 thread_local JcAssistState jc_assist;
 std::atomic<bool> jc_assist_enabled{false};
+Native native_reel_query = nullptr;
 
 bool CompatRead(u64 address, void* output, std::size_t size);
 u64 CompatWord(u64 address);
@@ -991,6 +992,11 @@ struct JcCapture {
     u64 descriptor = 0;
     u32 records = 0;
     u32 token_snapshots = 0;
+    u32 reel_records = 0;
+    u64 reel_action = 0;
+    u32 reel_queries = 0;
+    u32 reel_result = 0;
+    std::chrono::steady_clock::time_point reel_recorded{};
     std::unordered_map<u32, bool> names;
     std::unordered_map<u64, std::array<u64, 2>> objects;
     std::unordered_map<u64, std::array<u64, 2>> held_graphs;
@@ -1544,6 +1550,80 @@ void JcAssistTick() {
     if (accepted != 0) {
         jc_assist.pending = false;
         LOG_INFO(Input, "[DMC JC COMPAT] Retried melee accepted; attempts={}", jc_assist.attempts);
+    }
+}
+
+void PS4_SYSV_ABI ObserveReelQuery(void* object, void* frame, void* result) {
+    native_reel_query(object, frame, result);
+    if (!compat_enabled || !PadTrace::Enabled() || frame == nullptr || result == nullptr) {
+        return;
+    }
+    const auto queried = std::chrono::steady_clock::now();
+    const u64 function = LiveWord(reinterpret_cast<u64>(frame) + 0x18);
+    const u64 outer = function != 0 ? LiveWord(function + 0x40) : 0;
+    if (!CompatFunction(function, "OnTick") || outer == 0 ||
+        !CompatNameIndex(static_cast<u32>(LiveWord(outer + 0x48)),
+                         "DVAction_Dante_DemonPull_ReelIn") ||
+        !JcBudget()) {
+        return;
+    }
+    if (jc.reel_records >= 64) {
+        return;
+    }
+    const u64 action = LiveWord(reinterpret_cast<u64>(frame) + 0x20);
+    CompatMemoryScope memory{"jc_reel_query"};
+    if (!CompatClass(action, "DVAction_Dante_DemonPull_ReelIn") || compat.pawn == 0 ||
+        CompatObject(action, "m_Dante") != compat.pawn ||
+        CompatObject(action, "m_MorphemeControl") != reinterpret_cast<u64>(object)) {
+        return;
+    }
+    const u32 accepted = LiveDword(reinterpret_cast<u64>(result));
+    const bool first = jc.reel_action != action || jc.reel_queries == 0;
+    if (first) {
+        jc.reel_action = action;
+        jc.reel_queries = 0;
+    }
+    ++jc.reel_queries;
+    if (!first && accepted == jc.reel_result &&
+        queried - jc.reel_recorded < std::chrono::milliseconds{50}) {
+        return;
+    }
+    jc.reel_result = accepted;
+    jc.reel_recorded = queried;
+    ++jc.reel_records;
+    constexpr std::array fields{"m_RunTime", "m_fBufferTime", "m_fReelDuration"};
+    std::array<u32, fields.size()> values{};
+    u32 valid = 0;
+    for (u32 i = 0; i < fields.size(); ++i) {
+        const u32 offset = CompatOffset(action, fields[i]);
+        if (offset != 0 && CompatRead(action + offset, &values[i], sizeof(values[i]))) {
+            valid |= 1u << i;
+        }
+    }
+    const u64 parameters = CompatObject(action, "m_PullParams");
+    const u32 event_offset = CompatOffset(parameters, "m_StartDeflectID");
+    u32 event = 0;
+    if (event_offset != 0 && CompatRead(parameters + event_offset, &event, sizeof(event))) {
+        valid |= 8;
+    }
+    const auto finished = std::chrono::steady_clock::now();
+    u8 controller_flags = 0;
+    if (CompatRead(reinterpret_cast<u64>(object) + 0x80, &controller_flags,
+                   sizeof(controller_flags))) {
+        valid |= 16;
+    }
+    PadTrace::Record(
+        "JC_REEL_QUERY",
+        {static_cast<s64>(PadTrace::NextId()), static_cast<s64>(action),
+         reinterpret_cast<s64>(object), event, accepted,
+         std::chrono::duration_cast<std::chrono::microseconds>(queried.time_since_epoch()).count(),
+         valid, values[0], values[1], values[2], jc.reel_queries,
+         std::chrono::duration_cast<std::chrono::microseconds>(finished - queried).count(),
+         controller_flags, static_cast<s64>(CompatWord(reinterpret_cast<u64>(object) + 0x78)),
+         static_cast<s64>(CompatWord(reinterpret_cast<u64>(object) + 0xa8))});
+    JcIdentity(action);
+    if (jc.reel_records == 64) {
+        PadTrace::Record("JC_REEL_LIMIT", {64});
     }
 }
 
@@ -3413,6 +3493,18 @@ void InstallNative() {
     }
     jc_assist_enabled = false;
     LOG_INFO(Input, "[DMC JC COMPAT] Retry disabled in this root-cause investigation build");
+    constexpr std::array<u8, 15> reel_query_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                                  0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x10};
+    constexpr char reel_query_name[] = "UNTMorphemeControllerexecGetDiscreteEvent";
+    std::array<char, sizeof(reel_query_name)> reel_registration{};
+    if (matches(base + 0x20abfe0, reel_query_bytes) &&
+        Read(base + 0x25bd098, reel_registration.data(), reel_registration.size()) &&
+        std::memcmp(reel_registration.data(), reel_query_name, sizeof(reel_query_name)) == 0) {
+        native_reel_query = reinterpret_cast<Native>(NativeEntry(
+            base + 0x20abfe0, reinterpret_cast<u64>(&ObserveReelQuery), reel_query_bytes));
+    }
+    LOG_INFO(Input, "[DMC JC TRACE] Reel animation query observation installed={}",
+             native_reel_query != nullptr);
     native_condition_dispatch = reinterpret_cast<ConditionDispatch>(NativeEntry(
         base + 0x6d1e0, reinterpret_cast<u64>(&ObserveConditionDispatch), compat_dispatch_bytes));
     native_match_event = reinterpret_cast<GraphEvent>(
@@ -3541,8 +3633,8 @@ void InstallNative() {
 void Install() {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     jc_generation.fetch_add(1, std::memory_order_relaxed);
-    PadTrace::Record("JC_CAPTURE",
-                     {3, 4096, 128, compat_enabled.load(), 512, 32, jc_assist_enabled.load()});
+    PadTrace::Record("JC_CAPTURE", {4, 4096, 128, compat_enabled.load(), 512, 32,
+                                    jc_assist_enabled.load(), native_reel_query != nullptr, 64});
     return;
 #endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);
