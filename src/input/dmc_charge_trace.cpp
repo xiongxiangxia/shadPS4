@@ -1557,6 +1557,101 @@ void JcAssistTick() {
     }
 }
 
+void JcReelOutput(u64 request, u64 action, u64 controller, u32 event) {
+    if (!JcBudget()) {
+        return;
+    }
+    const u64 network = CompatWord(controller + 0xa8);
+    u32 before = 0;
+    u32 after = 0;
+    u16 node = 0;
+    u32 valid = 0;
+    u32 steps = 0;
+    u64 entry = 0;
+    s32 output_frame = 0;
+    u32 count = 0;
+    u32 examined = 0;
+    u32 matches = 0;
+    std::array<u32, 4> ids{};
+    u8 stage = 0;
+    const auto started = std::chrono::steady_clock::now();
+    if (network != 0 && CompatRead(network + 0x28, &before, sizeof(before))) {
+        valid |= 1;
+        const u64 definition = CompatWord(network);
+        const u64 node_id = definition != 0 ? CompatWord(definition + 0x4b8) : 0;
+        const u64 nodes = CompatWord(network + 0x18);
+        if (node_id != 0 && CompatRead(node_id, &node, sizeof(node)) && node != 0xffff &&
+            nodes != 0) {
+            valid |= 2;
+            entry = CompatWord(nodes + static_cast<u64>(node) * 0x88 + 8);
+            while (entry != 0 && steps < 32) {
+                std::array<u64, 6> header{};
+                if (!CompatRead(entry, header.data(), sizeof(header))) {
+                    break;
+                }
+                ++steps;
+                const u16 semantic = static_cast<u16>(header[4] >> 32);
+                if (semantic != 12) {
+                    entry = header[0];
+                    continue;
+                }
+                valid |= 4;
+                output_frame = static_cast<s32>(header[5]);
+                const u64 sampled = header[1] != 0 ? CompatWord(header[1] + 0x10) : 0;
+                if (sampled != 0 && CompatRead(sampled, &count, sizeof(count)) && count <= 4096) {
+                    valid |= 8;
+                    const u64 events = count != 0 ? CompatWord(sampled + 8) : 0;
+                    for (; events != 0 && examined < count && examined < 32; ++examined) {
+                        u32 id = 0;
+                        if (!CompatRead(events + static_cast<u64>(examined) * 0x14 + 8, &id,
+                                        sizeof(id))) {
+                            break;
+                        }
+                        if (examined < ids.size()) {
+                            ids[examined] = id;
+                        }
+                        matches += id == event;
+                    }
+                    if (examined == count) {
+                        valid |= 16;
+                    }
+                }
+                break;
+            }
+        }
+        if (CompatRead(network + 0x28, &after, sizeof(after))) {
+            valid |= 32;
+        }
+        const u64 owner = CompatWord(controller + 0xb0);
+        if (owner != 0 && CompatWord(owner + 0x418) == network &&
+            CompatRead(owner + 0x527, &stage, sizeof(stage))) {
+            valid |= 64;
+        }
+    }
+    PadTrace::Record("JC_REEL_OUTPUT", {static_cast<s64>(request),
+                                        static_cast<s64>(action),
+                                        static_cast<s64>(network),
+                                        valid,
+                                        before,
+                                        after,
+                                        node,
+                                        stage,
+                                        steps,
+                                        static_cast<s64>(entry),
+                                        output_frame,
+                                        count,
+                                        examined,
+                                        event,
+                                        matches,
+                                        ids[0],
+                                        ids[1],
+                                        ids[2],
+                                        ids[3],
+                                        std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() - started)
+                                            .count()});
+}
+
 void PS4_SYSV_ABI ObserveReelQuery(void* object, void* frame, void* result) {
     native_reel_query(object, frame, result);
     if (!compat_enabled || !PadTrace::Enabled() || frame == nullptr || result == nullptr) {
@@ -1615,6 +1710,8 @@ void PS4_SYSV_ABI ObserveReelQuery(void* object, void* frame, void* result) {
     if (event_offset != 0 && CompatRead(parameters + event_offset, &event, sizeof(event))) {
         valid |= 8;
     }
+    const u64 request = PadTrace::NextId();
+    JcReelOutput(request, action, reinterpret_cast<u64>(object), event);
     const auto finished = std::chrono::steady_clock::now();
     u8 controller_flags = 0;
     if (CompatRead(reinterpret_cast<u64>(object) + 0x80, &controller_flags,
@@ -1623,8 +1720,8 @@ void PS4_SYSV_ABI ObserveReelQuery(void* object, void* frame, void* result) {
     }
     PadTrace::Record(
         "JC_REEL_QUERY",
-        {static_cast<s64>(PadTrace::NextId()), static_cast<s64>(action),
-         reinterpret_cast<s64>(object), event, accepted,
+        {static_cast<s64>(request), static_cast<s64>(action), reinterpret_cast<s64>(object), event,
+         accepted,
          std::chrono::duration_cast<std::chrono::microseconds>(queried.time_since_epoch()).count(),
          valid, values[0], values[1], values[2], jc.reel_queries,
          std::chrono::duration_cast<std::chrono::microseconds>(finished - queried).count(),
@@ -3642,7 +3739,7 @@ void InstallNative() {
 void Install() {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     jc_generation.fetch_add(1, std::memory_order_relaxed);
-    PadTrace::Record("JC_CAPTURE", {4, 4096, 128, compat_enabled.load(), 512, 32,
+    PadTrace::Record("JC_CAPTURE", {5, 4096, 128, compat_enabled.load(), 512, 32,
                                     jc_assist_enabled.load(), native_reel_query != nullptr, 64});
     return;
 #endif
