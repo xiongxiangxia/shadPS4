@@ -809,6 +809,20 @@ Native native_reel_query = nullptr;
 bool CompatRead(u64 address, void* output, std::size_t size);
 u64 CompatWord(u64 address);
 
+bool CompatCheckedCopy(u64 address, void* output, std::size_t size) {
+    if (address == 0 || size > std::numeric_limits<u64>::max() - address) {
+        return false;
+    }
+    SIZE_T copied = 0;
+    if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), output, size,
+                          &copied) != 0 &&
+        copied == size) {
+        return true;
+    }
+    std::memset(output, 0, size);
+    return false;
+}
+
 struct CompatLookup {
     u64 value = 0;
     const char* name = nullptr;
@@ -869,12 +883,20 @@ struct CompatMetadataReader {
     std::size_t next = 0;
     u32 reads = 0;
     u32 queries = 0;
+    bool metadata_scan = false;
     std::chrono::nanoseconds query_time{};
 
     bool Copy(u64 address, void* output, std::size_t size) {
         ++reads;
         if (address == 0 || size > std::numeric_limits<u64>::max() - address) {
             return false;
+        }
+        if (!metadata_scan) {
+            const auto started = std::chrono::steady_clock::now();
+            const bool copied = CompatCheckedCopy(address, output, size);
+            query_time += std::chrono::steady_clock::now() - started;
+            ++queries;
+            return copied;
         }
         const u64 end = address + size;
         for (u64 cursor = address; cursor < end;) {
@@ -976,7 +998,7 @@ struct CompatMemoryScope {
 
 bool CompatRead(u64 address, void* output, std::size_t size) {
     return compat_memory != nullptr ? compat_memory->Copy(address, output, size)
-                                    : Read(address, output, size);
+                                    : CompatCheckedCopy(address, output, size);
 }
 
 u64 CompatWord(u64 address) {
@@ -1207,8 +1229,8 @@ u32 CompatOffset(u64 object, const char* name) {
     if (const auto found = offsets.find(key); found != offsets.end()) {
         return found->second;
     }
-    CompatMemoryScope memory{"offset"};
-    auto& metadata = *compat_memory;
+    CompatMetadataReader metadata;
+    metadata.metadata_scan = true;
     const u64 table = metadata.Pointer(guest_base + 0x3984330);
     u32 names = 0;
     if (table == 0 || !metadata.Copy(guest_base + 0x3984338, &names, sizeof(names)) || names == 0 ||
@@ -1746,9 +1768,10 @@ void CompatModeIntent() {
         compat.mode_held = true;
         return;
     }
-    if (mode != 0 || !compat.mode_held) {
+    if (mode != 0) {
         return;
     }
+    const bool from_grapple = compat.mode_held;
     compat.mode_held = false;
     u8 weapon = 0xff;
     if (!CompatRead(compat.pawn + compat.weapon_offset, &weapon, sizeof(weapon))) {
@@ -1760,12 +1783,18 @@ void CompatModeIntent() {
     if (gun == CompatGun::None) {
         return;
     }
+    float health = 0.0f;
+    if (compat.health_offset == 0 ||
+        !CompatRead(compat.pawn + compat.health_offset, &health, sizeof(health)) ||
+        !(health > 0.0f)) {
+        return;
+    }
     compat.gun = gun;
     ++compat.generation;
     compat.retries = 0;
     compat.milestones = 0;
-    LOG_INFO(Input, "[DMC COMPAT] Held gun intent after returning to human mode; gun={}",
-             static_cast<u32>(gun));
+    LOG_INFO(Input, "[DMC COMPAT] Held gun intent in human mode; gun={}, from_grapple={}",
+             static_cast<u32>(gun), from_grapple);
 }
 
 bool CompatPending() {
