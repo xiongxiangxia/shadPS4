@@ -8,14 +8,17 @@ Keyboard users need not install special tools. Existing DISPATCH/FILTER/RAW/INPU
 
 The added game records use the existing timestamped asynchronous recorder. Each thread/capture permits at most 4096 JC budget units (including identity/dictionary work), with JC_LIMIT on exhaustion and at most 128 decoded names. F9 resets this budget. Exhaustion or dropped rows invalidates arguments based on absent records. No global field/graph walk, instruction stepping, stack unwinding, or per-instruction logging is enabled. One validated graph-event detour is added to the six existing compatibility detours; when F9 is off it forwards directly to the original graph function.
 
+Format 2 narrows full JC scopes to native input type 0 (Pressed), verified against keyboard/button transitions in the first capture. Held/Released remain available in the existing input-delivery records but no longer activate full JC graph/condition logging. Jump-Held graph processing retains sparse result/active-node changes (up to 64 graph identities), so delayed jump acceptance is not completely hidden. Matching records include only definitions with the current event's descriptor; expected mismatches against other event classes are omitted. Object identity records are deduplicated by pointer/name/class, with at most 512 identities. Raw graph/condition pointers remain recorded if identity/name dictionaries are full. These filters reduce work rather than raising the 4096 budget. They do not cover every Held rejection condition; absence in this scope is not proof it never occurred.
+
 ## Record layout
 
 All pointers are observations only; pooled event addresses are not identities across time. Nesting uses request/parent IDs, not event-pointer equality. Game results must be interpreted at their own layer: an aggregate/graph return value or selected link does not prove the attack animation executed.
 
-- JC_CAPTURE: format version=1, budget=4096, name limit=128, compatibility active.
+- JC_CAPTURE: format version=2, budget=4096, name limit=128, compatibility active, identity limit=512. Version 1 did not filter Held/Released or unrelated candidate descriptors and could exhaust its budget rapidly.
 - JC_BEGIN p0=request, p1=parent, p2=stage (0 graph, 1 aggregate, 2 selector), p3=owner, p4=event, p5=kind (1 Jump, 2 LightMelee, 3 StrongMelee, 4 RangedAttack), p6=raw event type, p7=combo, p8=flags, p9=event play mode, p10=held input mask, p11=NTInput current mask, p12=mask readable, p13=NTInput pointer, p14=caller RVA. Modes: Normal=0, Demon=1, Angel=2. Do not confuse NTInput bit positions with the scePad mask.
 - JC_END: request, stage, result (selector uses the returned link pointer).
 - JC_ACTIVE: request, before=0/after=1, graph, active node. Only synchronous graph-call boundaries are observed, not all future node changes.
+- JC_HELD_GRAPH: graph, active node before, active node after, result. Jump-Held only; emitted for first accepted result, changes relative to the graph's previous result/after-node pair, or a node change during this call. Repeated unchanged results are omitted. No parent request or condition expansion is implied.
 - JC_MATCH: active request, candidate definition, native match result. This is before link conditions, not final acceptance.
 - JC_CONDITION: active request, caller RVA, condition object, function, context, pawn, original result. Captures verified graph/selector/link condition sites only. For gun events this precedes any compatibility override; jump and melee conditions are not rewritten.
 - JC_TOKEN: active request, condition, raw token FName. Only emitted for token-condition class.

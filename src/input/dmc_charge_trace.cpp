@@ -970,8 +970,11 @@ struct JcCapture {
     u64 generation = 0;
     u64 active = 0;
     u32 kind = 0;
+    u64 descriptor = 0;
     u32 records = 0;
     std::unordered_map<u32, bool> names;
+    std::unordered_map<u64, std::array<u64, 2>> objects;
+    std::unordered_map<u64, std::array<u64, 2>> held_graphs;
 };
 
 thread_local JcCapture jc;
@@ -1024,11 +1027,20 @@ void JcName(u32 index) {
 }
 
 void JcIdentity(u64 object) {
-    if (object == 0 || !JcBudget()) {
+    if (object == 0 || !PadTrace::Enabled() || jc.objects.size() >= 512) {
         return;
     }
     const u64 name = CompatWord(object + 0x48);
     const u64 type = CompatWord(object + 0x50);
+    const std::array<u64, 2> identity{name, type};
+    if (const auto found = jc.objects.find(object);
+        found != jc.objects.end() && found->second == identity) {
+        return;
+    }
+    if (!JcBudget()) {
+        return;
+    }
+    jc.objects.insert_or_assign(object, identity);
     const u64 class_name = type != 0 ? CompatWord(type + 0x48) : 0;
     PadTrace::Record("JC_OBJECT",
                      {static_cast<s64>(jc.active), static_cast<s64>(object), static_cast<s64>(name),
@@ -1041,10 +1053,13 @@ struct JcScope {
     u64 request = 0;
     u64 previous = 0;
     u32 previous_kind = 0;
+    u64 previous_descriptor = 0;
     u64 generation = 0;
     u32 stage;
     u64 object;
     bool entered = false;
+    bool held_jump = false;
+    u64 before_node = 0;
 
     JcScope(u32 step, void* owner, void* event, u64 caller)
         : stage{step}, object{reinterpret_cast<u64>(owner)} {
@@ -1058,9 +1073,11 @@ struct JcScope {
         }
         previous = jc.active;
         previous_kind = jc.kind;
+        previous_descriptor = jc.descriptor;
         entered = true;
         jc.active = 0;
         jc.kind = 0;
+        jc.descriptor = 0;
         if (event == nullptr) {
             return;
         }
@@ -1075,12 +1092,18 @@ struct JcScope {
                          : CompatNameIndex(name, "DVButton_StrongMelee")  ? 3
                          : CompatNameIndex(name, "DVButton_RangedAttack") ? 4
                                                                           : 0;
-        if (kind == 0 || !JcBudget()) {
+        const u8 type = *reinterpret_cast<const u8*>(address + 0x78);
+        held_jump = kind == 1 && type == 2 && stage == 0;
+        if (held_jump) {
+            before_node = LiveWord(object + 0x88);
+        }
+        if (kind == 0 || type != 0 || !JcBudget()) {
             return;
         }
         request = PadTrace::NextId();
         jc.active = request;
         jc.kind = kind;
+        jc.descriptor = descriptor;
         u32 buttons = 0;
         const bool buttons_valid =
             compat.input != 0 && CompatRead(compat.input + 0x220, &buttons, sizeof(buttons));
@@ -1106,6 +1129,23 @@ struct JcScope {
     }
 
     void End(u64 result) {
+        if (held_jump && entered && PadTrace::Enabled()) {
+            const u64 after_node = LiveWord(object + 0x88);
+            const std::array<u64, 2> state{after_node, result};
+            const auto found = jc.held_graphs.find(object);
+            const bool changed = found != jc.held_graphs.end() && found->second != state;
+            const bool first_accepted = found == jc.held_graphs.end() && result != 0;
+            if (found != jc.held_graphs.end() || jc.held_graphs.size() < 64) {
+                jc.held_graphs.insert_or_assign(object, state);
+                if ((changed || first_accepted || before_node != after_node) && JcBudget()) {
+                    PadTrace::Record("JC_HELD_GRAPH",
+                                     {static_cast<s64>(object), static_cast<s64>(before_node),
+                                      static_cast<s64>(after_node), static_cast<s64>(result)});
+                    JcIdentity(before_node);
+                    JcIdentity(after_node);
+                }
+            }
+        }
         if (request != 0 && JcBudget()) {
             PadTrace::Record("JC_END",
                              {static_cast<s64>(request), stage, static_cast<s64>(result)});
@@ -1125,6 +1165,7 @@ struct JcScope {
         if (entered && jc.generation == generation) {
             jc.active = previous;
             jc.kind = previous_kind;
+            jc.descriptor = previous_descriptor;
         }
     }
 };
@@ -2284,7 +2325,8 @@ u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     if (compat_enabled) {
         const u32 result = CompatMatch(definition, event);
-        if (jc.active != 0 && JcBudget()) {
+        if (jc.active != 0 && definition != nullptr &&
+            LiveWord(reinterpret_cast<u64>(definition) + 0x68) == jc.descriptor && JcBudget()) {
             PadTrace::Record("JC_MATCH", {static_cast<s64>(jc.active),
                                           reinterpret_cast<s64>(definition), result});
             JcIdentity(reinterpret_cast<u64>(definition));
@@ -3174,7 +3216,7 @@ void InstallNative() {
 void Install() {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     jc_generation.fetch_add(1, std::memory_order_relaxed);
-    PadTrace::Record("JC_CAPTURE", {1, 4096, 128, compat_enabled.load()});
+    PadTrace::Record("JC_CAPTURE", {2, 4096, 128, compat_enabled.load(), 512});
     return;
 #endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);
