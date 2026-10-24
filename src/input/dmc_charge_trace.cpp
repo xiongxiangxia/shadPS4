@@ -803,7 +803,7 @@ struct JcAssistState {
 };
 
 thread_local JcAssistState jc_assist;
-std::atomic<bool> jc_assist_enabled{true};
+std::atomic<bool> jc_assist_enabled{false};
 
 bool CompatRead(u64 address, void* output, std::size_t size);
 u64 CompatWord(u64 address);
@@ -1483,6 +1483,30 @@ void JcTokenSnapshot(u64 condition, u64 pawn, u64 token) {
                           static_cast<s64>(node), static_cast<s64>(action), readable, runtime,
                           static_cast<s64>(timeline), timeline_readable, timeline_time});
         JcIdentity(action);
+        const u64 definition = CompatObject(node, "m_ActionDef");
+        if (definition != 0 && JcBudget()) {
+            constexpr std::array fields{"AnimationLength", "IntoAnimationLength",
+                                        "SettleAnimationLength", "PlaySpeed", "LoopCount"};
+            std::array<u32, fields.size()> values{};
+            u32 valid = 0;
+            for (u32 field = 0; field < fields.size(); ++field) {
+                const u32 field_offset = CompatOffset(definition, fields[field]);
+                if (field_offset != 0 &&
+                    CompatRead(definition + field_offset, &values[field], sizeof(values[field]))) {
+                    valid |= 1u << field;
+                }
+            }
+            u32 denominator = 0;
+            if (CompatClass(definition, "NTActionDef_Attack") &&
+                CompatRead(definition + 0x160, &denominator, sizeof(denominator))) {
+                valid |= 1u << fields.size();
+            }
+            PadTrace::Record("JC_ACTION_CONFIG",
+                             {static_cast<s64>(jc.active), static_cast<s64>(action),
+                              static_cast<s64>(definition), valid, values[0], values[1], values[2],
+                              values[3], values[4], denominator});
+            JcIdentity(definition);
+        }
     }
 }
 
@@ -3387,19 +3411,8 @@ void InstallNative() {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
     }
-    constexpr std::array<u8, 17> sender_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
-                                              0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
-    constexpr std::array<u8, 14> dante_sender_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
-                                                    0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
-    auto creator_bytes = sender_bytes;
-    creator_bytes.back() = 0x48;
-    const char* jc_setting = std::getenv("SHADPS4_DMC_JC_COMPAT");
-    jc_assist_enabled = (jc_setting == nullptr || std::strcmp(jc_setting, "0") != 0) &&
-                        matches(base + 0xb0d510, sender_bytes) &&
-                        matches(base + 0xb0d910, dante_sender_bytes) &&
-                        matches(base + 0xb0c170, creator_bytes);
-    LOG_INFO(Input, "[DMC JC COMPAT] Bounded Demon Pull Leap melee retry enabled={}",
-             jc_assist_enabled.load());
+    jc_assist_enabled = false;
+    LOG_INFO(Input, "[DMC JC COMPAT] Retry disabled in this root-cause investigation build");
     native_condition_dispatch = reinterpret_cast<ConditionDispatch>(NativeEntry(
         base + 0x6d1e0, reinterpret_cast<u64>(&ObserveConditionDispatch), compat_dispatch_bytes));
     native_match_event = reinterpret_cast<GraphEvent>(
