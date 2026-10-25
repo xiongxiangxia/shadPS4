@@ -787,6 +787,23 @@ struct CompatState {
 
 thread_local CompatState compat;
 
+struct CompatBufferScope;
+thread_local CompatBufferScope* compat_buffer = nullptr;
+
+struct CompatBufferScope {
+    CompatBufferScope* previous = compat_buffer;
+    u64 aggregator = 0;
+    u64 event = 0;
+    u64 descriptor = 0;
+
+    CompatBufferScope() {
+        compat_buffer = nullptr;
+    }
+    ~CompatBufferScope() {
+        compat_buffer = previous;
+    }
+};
+
 struct JcAssistState {
     u64 graph = 0;
     u64 node = 0;
@@ -2059,6 +2076,44 @@ bool CompatBufferedGun(u32& count, bool& held_gun) {
     return true;
 }
 
+bool CompatProtectBuffer(void* event, u64 caller) {
+    if (compat_buffer == nullptr || compat_buffer->event != reinterpret_cast<u64>(event) ||
+        (caller != guest_base + 0xa1c5d8 && caller != guest_base + 0xa1c678)) {
+        return false;
+    }
+    CompatMemoryScope memory{"buffer_admission"};
+    const u64 aggregator = compat_buffer->aggregator;
+    u32 count = 0;
+    u32 capacity = 0;
+    if (!CompatRead(aggregator + 0x80, &count, sizeof(count)) || count == 0 || count > 64 ||
+        !CompatRead(aggregator + 0x84, &capacity, sizeof(capacity)) || capacity < count) {
+        return false;
+    }
+    std::array<u64, 64> events{};
+    const u64 array = CompatWord(aggregator + 0x78);
+    if (array == 0 || !CompatRead(array, events.data(), count * sizeof(events[0]))) {
+        return false;
+    }
+    bool other_input = false;
+    for (u32 i = 0; i < count; ++i) {
+        u64 descriptor = 0;
+        u8 type = 255;
+        if (events[i] == 0 || !CompatRead(events[i] + 0x60, &descriptor, sizeof(descriptor)) ||
+            !CompatRead(events[i] + 0x78, &type, sizeof(type)) || descriptor == 0) {
+            return false;
+        }
+        other_input |= descriptor != compat_buffer->descriptor || type != 2;
+    }
+    if (other_input && (compat.milestones & 256) == 0) {
+        compat.milestones |= 256;
+        LOG_INFO(Input,
+                 "[DMC COMPAT] Preserved other queued inputs from held-gun buffer replacement; "
+                 "count={}, immediate charge matching remains enabled",
+                 count);
+    }
+    return other_input;
+}
+
 void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     if (!compat_enabled) {
         return compat_bool(object, frame, result);
@@ -2392,6 +2447,7 @@ void* CompatSelect(void* set, void* event) {
 }
 
 u32 CompatAggregate(void* object, void* event, u32 input) {
+    CompatBufferScope buffer_scope;
     const u64 address = reinterpret_cast<u64>(event);
     bool observe_melee = false;
     u64 descriptor = 0;
@@ -2415,7 +2471,7 @@ u32 CompatAggregate(void* object, void* event, u32 input) {
     const bool previous_denied = jc_assist.denied;
     jc_assist.observing_event = observe_melee ? address : 0;
     jc_assist.denied = false;
-    if (input != 0 && event != nullptr && (compat.gun != CompatGun::None || compat.mode_held) &&
+    if (event != nullptr && (compat.gun != CompatGun::None || compat.mode_held) &&
         *reinterpret_cast<const u8*>(address + 0x78) == 2) {
         CompatMemoryScope memory{"aggregate"};
         const u64 descriptor = LiveWord(address + 0x60);
@@ -2425,6 +2481,12 @@ u32 CompatAggregate(void* object, void* event, u32 input) {
             CompatHeld()) {
             compat.gun_descriptor = descriptor;
             compat.aggregator = reinterpret_cast<u64>(object);
+            if (compat.aggregator == CompatWord(compat.pawn + 0x930) && CompatPending()) {
+                buffer_scope.aggregator = compat.aggregator;
+                buffer_scope.event = address;
+                buffer_scope.descriptor = descriptor;
+                compat_buffer = &buffer_scope;
+            }
         }
     }
     const u32 accepted = native_aggregate_event(object, event, input);
@@ -3039,6 +3101,10 @@ u32 PS4_SYSV_ABI ObserveGateMatch(void* definition, void* event) {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     if (compat_enabled) {
         const u32 result = CompatMatch(definition, event);
+        if (result != 0 &&
+            CompatProtectBuffer(event, reinterpret_cast<u64>(__builtin_return_address(0)))) {
+            return 0;
+        }
         if (jc.active != 0 && definition != nullptr &&
             LiveWord(reinterpret_cast<u64>(definition) + 0x68) == jc.descriptor && JcBudget()) {
             PadTrace::Record("JC_MATCH", {static_cast<s64>(jc.active),
@@ -3788,6 +3854,9 @@ void InstallNative() {
                                                     0x56, 0x41, 0x54, 0x53, 0x49, 0x89, 0xf7};
     constexpr std::array<u8, 10> compat_link_layout{0x41, 0x39, 0x5f, 0x68, 0x7e,
                                                     0x26, 0x49, 0x8b, 0x47, 0x60};
+    constexpr std::array<u8, 7> compat_buffer_match_first{0xe8, 0x48, 0x9e, 0x00, 0x00, 0x85, 0xc0};
+    constexpr std::array<u8, 7> compat_buffer_match_second{0xe8, 0xa8, 0x9d, 0x00,
+                                                           0x00, 0x85, 0xc0};
     const auto matches = [](u64 address, const auto& expected) {
         auto actual = expected;
         return Read(address, actual.data(), actual.size()) && actual == expected;
@@ -3798,7 +3867,9 @@ void InstallNative() {
         !matches(base + 0xa20850, compat_select_bytes) ||
         !matches(base + 0xa26420, compat_match_bytes) ||
         !matches(base + 0xa1fe10, compat_select_bytes) ||
-        !matches(base + 0xa20973, compat_link_layout)) {
+        !matches(base + 0xa20973, compat_link_layout) ||
+        !matches(base + 0xa1c5d3, compat_buffer_match_first) ||
+        !matches(base + 0xa1c673, compat_buffer_match_second)) {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
     }
