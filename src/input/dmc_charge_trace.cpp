@@ -754,6 +754,8 @@ bool NameIs(u32 index, const char* expected) {
 
 #ifdef ENABLE_DMC_CHARGE_COMPAT
 Native compat_bool = nullptr;
+GraphEvent compat_asleep = nullptr;
+GraphEvent compat_awake = nullptr;
 std::atomic<bool> compat_enabled{false};
 std::atomic<u64> compat_consumed_property{0};
 std::atomic<u64> compat_player_tick{0};
@@ -795,6 +797,7 @@ struct CompatBufferScope {
     u64 aggregator = 0;
     u64 event = 0;
     u64 descriptor = 0;
+    bool parallel = false;
 
     CompatBufferScope() {
         compat_buffer = nullptr;
@@ -2081,37 +2084,12 @@ bool CompatProtectBuffer(void* event, u64 caller) {
         (caller != guest_base + 0xa1c5d8 && caller != guest_base + 0xa1c678)) {
         return false;
     }
-    CompatMemoryScope memory{"buffer_admission"};
-    const u64 aggregator = compat_buffer->aggregator;
-    u32 count = 0;
-    u32 capacity = 0;
-    if (!CompatRead(aggregator + 0x80, &count, sizeof(count)) || count == 0 || count > 64 ||
-        !CompatRead(aggregator + 0x84, &capacity, sizeof(capacity)) || capacity < count) {
-        return false;
+    if ((compat.milestones & 1024) == 0) {
+        compat.milestones |= 1024;
+        LOG_INFO(Input, "[DMC COMPAT] Held charge intent kept outside action buffer; immediate "
+                        "charge matching remains enabled");
     }
-    std::array<u64, 64> events{};
-    const u64 array = CompatWord(aggregator + 0x78);
-    if (array == 0 || !CompatRead(array, events.data(), count * sizeof(events[0]))) {
-        return false;
-    }
-    bool other_input = false;
-    for (u32 i = 0; i < count; ++i) {
-        u64 descriptor = 0;
-        u8 type = 255;
-        if (events[i] == 0 || !CompatRead(events[i] + 0x60, &descriptor, sizeof(descriptor)) ||
-            !CompatRead(events[i] + 0x78, &type, sizeof(type)) || descriptor == 0) {
-            return false;
-        }
-        other_input |= descriptor != compat_buffer->descriptor || type != 2;
-    }
-    if (other_input && (compat.milestones & 256) == 0) {
-        compat.milestones |= 256;
-        LOG_INFO(Input,
-                 "[DMC COMPAT] Preserved other queued inputs from held-gun buffer replacement; "
-                 "count={}, immediate charge matching remains enabled",
-                 count);
-    }
-    return other_input;
+    return true;
 }
 
 void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
@@ -2372,6 +2350,54 @@ void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
     }
 }
 
+bool CompatChargeEntry(u64 set) {
+    if (set == 0) {
+        return false;
+    }
+    const u64 links = CompatWord(set + 0x60);
+    u32 count = 0;
+    if (!CompatRead(set + 0x68, &count, sizeof(count)) || count > 256) {
+        return false;
+    }
+    for (u32 i = 0; links != 0 && i < count; ++i) {
+        const u64 link = CompatWord(links + i * 8);
+        if (link != 0 && CompatTarget(CompatWord(link + 0x60)) == compat.gun) {
+            return true;
+        }
+    }
+    return false;
+}
+
+u32 PS4_SYSV_ABI CompatAsleep(void* node, void* event) {
+    const u64 address = reinterpret_cast<u64>(node);
+    const auto caller = reinterpret_cast<u64>(__builtin_return_address(0));
+    auto* scope = compat_buffer;
+    if (!compat_enabled || scope == nullptr || scope->parallel ||
+        scope->event != reinterpret_cast<u64>(event) || caller != guest_base + 0xa1ffa5) {
+        return compat_asleep(node, event);
+    }
+    CompatMemoryScope memory{"parallel_charge"};
+    const u64 graph = CompatWord(address + 0x70);
+    u8 flags = 0;
+    if (graph == 0 || CompatWord(graph + 0x78) != scope->aggregator ||
+        CompatWord(graph + 0x88) != address || !CompatPending() ||
+        !CompatRead(address + 0xb4, &flags, sizeof(flags)) ||
+        !(((flags & 4) != 0 && CompatChargeEntry(CompatWord(address + 0x80))) ||
+          ((flags & 2) != 0 && CompatChargeEntry(CompatWord(address + 0x88))))) {
+        return compat_asleep(node, event);
+    }
+    scope->parallel = true;
+    const u32 accepted = compat_awake(node, event);
+    scope->parallel = false;
+    const u32 bit = accepted != 0 ? 2048 : 4096;
+    if ((compat.milestones & bit) == 0) {
+        compat.milestones |= bit;
+        LOG_INFO(Input, "[DMC COMPAT] Concurrent charge entry during recovery: accepted={}",
+                 accepted);
+    }
+    return accepted;
+}
+
 u32 CompatMatch(void* definition, void* event) {
     if (!compat.selecting) {
         return native_match_event(definition, event);
@@ -2421,19 +2447,13 @@ void* CompatSelect(void* set, void* event) {
     }
     CompatMemoryScope memory{"select"};
     compat.selecting = CompatPending();
+    if (compat_buffer != nullptr && compat_buffer->parallel && !compat.selecting) {
+        return nullptr;
+    }
     if (compat.selecting) {
-        const u64 set_address = reinterpret_cast<u64>(set);
-        const u64 links = LiveWord(set_address + 0x60);
-        const u32 count = LiveDword(set_address + 0x68);
-        bool charge_entry = false;
-        if (count <= 256) {
-            for (u32 i = 0; links != 0 && i < count; ++i) {
-                const u64 link = LiveWord(links + i * 8);
-                if (link != 0 && CompatTarget(LiveWord(link + 0x60)) == compat.gun) {
-                    charge_entry = true;
-                    break;
-                }
-            }
+        const bool charge_entry = CompatChargeEntry(reinterpret_cast<u64>(set));
+        if (compat_buffer != nullptr && compat_buffer->parallel && !charge_entry) {
+            return nullptr;
         }
         compat.selecting = charge_entry;
     }
@@ -3857,6 +3877,12 @@ void InstallNative() {
     constexpr std::array<u8, 7> compat_buffer_match_first{0xe8, 0x48, 0x9e, 0x00, 0x00, 0x85, 0xc0};
     constexpr std::array<u8, 7> compat_buffer_match_second{0xe8, 0xa8, 0x9d, 0x00,
                                                            0x00, 0x85, 0xc0};
+    constexpr std::array<u8, 17> compat_asleep_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
+                                                     0x41, 0x56, 0x41, 0x54, 0x53, 0x49,
+                                                     0x89, 0xf6, 0x49, 0x89, 0xfc};
+    constexpr std::array<u8, 17> compat_awake_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
+                                                    0x41, 0x56, 0x41, 0x54, 0x53, 0x49,
+                                                    0x89, 0xf6, 0x48, 0x89, 0xfb};
     const auto matches = [](u64 address, const auto& expected) {
         auto actual = expected;
         return Read(address, actual.data(), actual.size()) && actual == expected;
@@ -3869,7 +3895,9 @@ void InstallNative() {
         !matches(base + 0xa1fe10, compat_select_bytes) ||
         !matches(base + 0xa20973, compat_link_layout) ||
         !matches(base + 0xa1c5d3, compat_buffer_match_first) ||
-        !matches(base + 0xa1c673, compat_buffer_match_second)) {
+        !matches(base + 0xa1c673, compat_buffer_match_second) ||
+        !matches(base + 0xa21f30, compat_asleep_bytes) ||
+        !matches(base + 0xa21da0, compat_awake_bytes)) {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
     }
@@ -3897,6 +3925,9 @@ void InstallNative() {
         base + 0xa1fe10, reinterpret_cast<u64>(&ObserveGraphEvent), compat_select_bytes));
     native_aggregate_event = reinterpret_cast<AggregateEvent>(NativeEntry(
         base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), compat_let_bytes));
+    compat_awake = reinterpret_cast<GraphEvent>(base + 0xa21da0);
+    compat_asleep = reinterpret_cast<GraphEvent>(
+        NativeEntry(base + 0xa21f30, reinterpret_cast<u64>(&CompatAsleep), compat_asleep_bytes));
     compat_bool = reinterpret_cast<Native>(
         NativeEntry(base + 0x55b90, reinterpret_cast<u64>(&CompatBool), bool_bytes));
     original.store(reinterpret_cast<Native>(NativeEntry(
@@ -3905,6 +3936,7 @@ void InstallNative() {
     compat_enabled = native_condition_dispatch != nullptr && native_match_event != nullptr &&
                      native_graph_event != nullptr && native_select_link != nullptr &&
                      compat_bool != nullptr && native_aggregate_event != nullptr &&
+                     compat_asleep != nullptr &&
                      original.load(std::memory_order_acquire) != nullptr;
     LOG_INFO(Input,
              "[DMC COMPAT] Entry hooks installed={}; awaiting BoolVariable verification; no "
