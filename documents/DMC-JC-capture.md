@@ -1,15 +1,10 @@
 # JC jump-cancel melee capture
 
-## Concurrent charge regression follow-up
+## Current playback baseline
 
-The current COMPAT build preserves the held charge intent outside the shared input buffer, but no longer calls the full Awake handler to force charge during recovery. After the matching charge link passes the original selector, it uses the original graph operation guards and validated link execution, without the Awake handler's additional reset of the source node or release of its pending input. Gameplay effects, including projectile damage, require testing. JC retry stays disabled.
+The premature concurrent-charge experiments from d58a8b06/f6afb3f1 have been reverted after reports of missing shots/damage and lingering charge effects. This build restores the 8c8614fb source, including the 2a33477b compatibility behavior and the bounded GunSpecial observations below. The experimental Asleep detour, manual link execution and COMPAT_CONCURRENT records are not installed. JC retry remains disabled. The original GunSpecial/recharge timing issue remains unresolved; restoring this baseline is not a root-cause fix.
 
-With F9 enabled, at most 64 accepted route attempts per thread/capture produce paired records. They share the existing JC budget and identity dictionaries; no additional hook is installed. COMPAT_CONCURRENT_LIMIT means later attempts are unobserved. Capture can perturb timing, and these records do not observe projectile creation, collision or damage:
-
-- COMPAT_CONCURRENT_BEGIN: route ID, graph, source node, selected link, source action if ActionNode, source node state, source node flags, input-buffer owner, input-buffer count, ActionNode-layout flag.
-- COMPAT_CONCURRENT_END: route ID, graph, current node, source-is-still-current flag, source state if still current, source action if still current and ActionNode, input-buffer owner, input-buffer count, source-action-layout-valid flag. Conditional fields are unavailable when their flags are false, not evidence that the fields were cleared. The completed native route may itself have further side effects; this observation does not promise the old action survives.
-
-## Earlier GunSpecial investigation
+## Current GunSpecial investigation
 
 The gameplay compatibility remains the 2a33477b behavior, including the safe live-copy performance change. This revision only adds F9 observations for DVButton_GunSpecial, kind 5 in JC_BEGIN. GunSpecial Pressed and Released events are traced; other recorded buttons remain Pressed-only, with the previous sparse JumpHeld observation. Aggregate acceptance is not proof of animation execution. Replayed GunSpecial events are captured through the existing graph handler and identified by their caller, without another hook or event query.
 
