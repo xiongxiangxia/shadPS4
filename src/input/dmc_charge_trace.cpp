@@ -755,7 +755,7 @@ bool NameIs(u32 index, const char* expected) {
 #ifdef ENABLE_DMC_CHARGE_COMPAT
 Native compat_bool = nullptr;
 GraphEvent compat_asleep = nullptr;
-GraphEvent compat_awake = nullptr;
+OwnerSwitch compat_execute_link = nullptr;
 std::atomic<bool> compat_enabled{false};
 std::atomic<u64> compat_consumed_property{0};
 std::atomic<u64> compat_player_tick{0};
@@ -1036,6 +1036,7 @@ struct JcCapture {
     u32 token_snapshots = 0;
     u32 gun_states = 0;
     u32 gun_nodes = 0;
+    u32 concurrent_routes = 0;
     u64 gun_request = 0;
     u64 gun_graph = 0;
     u64 gun_pawn = 0;
@@ -2368,6 +2369,8 @@ bool CompatChargeEntry(u64 set) {
     return false;
 }
 
+void* CompatSelect(void* set, void* event);
+
 u32 PS4_SYSV_ABI CompatAsleep(void* node, void* event) {
     const u64 address = reinterpret_cast<u64>(node);
     const auto caller = reinterpret_cast<u64>(__builtin_return_address(0));
@@ -2387,12 +2390,66 @@ u32 PS4_SYSV_ABI CompatAsleep(void* node, void* event) {
         return compat_asleep(node, event);
     }
     scope->parallel = true;
-    const u32 accepted = compat_awake(node, event);
+    void* selected = nullptr;
+    if ((flags & 4) != 0) {
+        selected = CompatSelect(reinterpret_cast<void*>(CompatWord(address + 0x80)), event);
+    }
+    if (selected == nullptr && (flags & 2) != 0) {
+        selected = CompatSelect(reinterpret_cast<void*>(CompatWord(address + 0x88)), event);
+    }
+    const u64 table = CompatWord(graph);
+    const u64 begin = table != 0 ? CompatWord(table + 0x280) : 0;
+    const u64 end = table != 0 ? CompatWord(table + 0x288) : 0;
+    const bool executable = begin >= guest_base && begin < guest_base + 0x2f7b360 &&
+                            end >= guest_base && end < guest_base + 0x2f7b360;
+    const u64 selected_table =
+        selected != nullptr ? CompatWord(reinterpret_cast<u64>(selected)) : 0;
+    const u64 execute = selected_table != 0 ? CompatWord(selected_table + 0x250) : 0;
+    const u32 accepted =
+        selected != nullptr && executable && execute == reinterpret_cast<u64>(compat_execute_link);
+    if (accepted != 0) {
+        const bool trace = PadTrace::Enabled() && JcBudget() && jc.concurrent_routes < 64;
+        const u64 request = trace ? PadTrace::NextId() : 0;
+        const bool action_node = trace && CompatClass(address, "NTActionGraph_ActionNode");
+        if (trace) {
+            ++jc.concurrent_routes;
+            PadTrace::Record("COMPAT_CONCURRENT_BEGIN",
+                             {static_cast<s64>(request), static_cast<s64>(graph),
+                              static_cast<s64>(address), reinterpret_cast<s64>(selected),
+                              action_node ? static_cast<s64>(CompatWord(address + 0x78)) : 0,
+                              LiveDword(address + 0xd0), flags,
+                              static_cast<s64>(CompatWord(scope->aggregator + 0xa0)),
+                              LiveDword(scope->aggregator + 0x80), action_node});
+            JcIdentity(address);
+            if (action_node) {
+                JcIdentity(CompatWord(address + 0x78));
+            }
+            if (jc.concurrent_routes == 64) {
+                PadTrace::Record("COMPAT_CONCURRENT_LIMIT", {64});
+            }
+        }
+        reinterpret_cast<AggregateOperation>(begin)(reinterpret_cast<void*>(graph));
+        compat_execute_link(selected, event);
+        reinterpret_cast<AggregateOperation>(end)(reinterpret_cast<void*>(graph));
+        if (trace) {
+            const u64 current = CompatWord(graph + 0x88);
+            PadTrace::Record(
+                "COMPAT_CONCURRENT_END",
+                {static_cast<s64>(request), static_cast<s64>(graph), static_cast<s64>(current),
+                 current == address, current == address ? LiveDword(address + 0xd0) : 0,
+                 current == address && action_node ? static_cast<s64>(CompatWord(address + 0x78))
+                                                   : 0,
+                 static_cast<s64>(CompatWord(scope->aggregator + 0xa0)),
+                 LiveDword(scope->aggregator + 0x80), current == address && action_node});
+        }
+    }
     scope->parallel = false;
     const u32 bit = accepted != 0 ? 2048 : 4096;
     if ((compat.milestones & bit) == 0) {
         compat.milestones |= bit;
-        LOG_INFO(Input, "[DMC COMPAT] Concurrent charge entry during recovery: accepted={}",
+        LOG_INFO(Input,
+                 "[DMC COMPAT] Concurrent charge link during recovery: accepted={}; no forced "
+                 "reset of source node",
                  accepted);
     }
     return accepted;
@@ -3883,6 +3940,9 @@ void InstallNative() {
     constexpr std::array<u8, 17> compat_awake_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
                                                     0x41, 0x56, 0x41, 0x54, 0x53, 0x49,
                                                     0x89, 0xf6, 0x48, 0x89, 0xfb};
+    constexpr std::array<u8, 16> compat_execute_bytes{0x55, 0x48, 0x89, 0xe5, 0x53, 0x50,
+                                                      0x48, 0x89, 0xf0, 0x48, 0x89, 0xfb,
+                                                      0x48, 0x8b, 0x7b, 0x68};
     const auto matches = [](u64 address, const auto& expected) {
         auto actual = expected;
         return Read(address, actual.data(), actual.size()) && actual == expected;
@@ -3897,7 +3957,8 @@ void InstallNative() {
         !matches(base + 0xa1c5d3, compat_buffer_match_first) ||
         !matches(base + 0xa1c673, compat_buffer_match_second) ||
         !matches(base + 0xa21f30, compat_asleep_bytes) ||
-        !matches(base + 0xa21da0, compat_awake_bytes)) {
+        !matches(base + 0xa21da0, compat_awake_bytes) ||
+        !matches(base + 0xa23600, compat_execute_bytes)) {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
     }
@@ -3925,7 +3986,7 @@ void InstallNative() {
         base + 0xa1fe10, reinterpret_cast<u64>(&ObserveGraphEvent), compat_select_bytes));
     native_aggregate_event = reinterpret_cast<AggregateEvent>(NativeEntry(
         base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), compat_let_bytes));
-    compat_awake = reinterpret_cast<GraphEvent>(base + 0xa21da0);
+    compat_execute_link = reinterpret_cast<OwnerSwitch>(base + 0xa23600);
     compat_asleep = reinterpret_cast<GraphEvent>(
         NativeEntry(base + 0xa21f30, reinterpret_cast<u64>(&CompatAsleep), compat_asleep_bytes));
     compat_bool = reinterpret_cast<Native>(
