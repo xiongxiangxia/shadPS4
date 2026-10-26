@@ -787,6 +787,27 @@ struct CompatState {
 
 thread_local CompatState compat;
 
+struct CompatQueueScope;
+thread_local CompatQueueScope* compat_queue = nullptr;
+
+struct CompatQueueScope {
+    CompatQueueScope* previous = compat_queue;
+    u64 event = 0;
+    u64 descriptor = 0;
+    u64 aggregator = 0;
+    u64 gun_descriptor = 0;
+    u64 generation = 0;
+    u8 type = 255;
+    bool attack = false;
+
+    CompatQueueScope() {
+        compat_queue = nullptr;
+    }
+    ~CompatQueueScope() {
+        compat_queue = previous;
+    }
+};
+
 struct JcAssistState {
     u64 graph = 0;
     u64 node = 0;
@@ -1016,6 +1037,9 @@ struct JcCapture {
     u32 token_snapshots = 0;
     u32 gun_states = 0;
     u32 gun_nodes = 0;
+    u32 queue_decisions = 0;
+    u64 queue_owner = 0;
+    std::chrono::steady_clock::time_point queue_recorded{};
     u64 gun_request = 0;
     u64 gun_graph = 0;
     u64 gun_pawn = 0;
@@ -2059,6 +2083,103 @@ bool CompatBufferedGun(u32& count, bool& held_gun) {
     return true;
 }
 
+void CompatQueueDecision(u32 decision, u32 result, u32 count, u64 owner, u8 policy) {
+    const u32 bit = decision == 1 ? 1024 : result != 0 ? 2048 : 4096;
+    if ((compat.milestones & bit) == 0) {
+        compat.milestones |= bit;
+        LOG_INFO(Input,
+                 "[DMC COMPAT] Input buffer arbitration: decision={}, accepted={}, count={}; "
+                 "native action lifecycle retained",
+                 decision, result, count);
+    }
+    if (!PadTrace::Enabled() || !JcBudget() || jc.queue_decisions >= 64) {
+        return;
+    }
+    if (decision == 1) {
+        const auto now = std::chrono::steady_clock::now();
+        if (jc.queue_owner == owner && now - jc.queue_recorded < std::chrono::milliseconds{50}) {
+            return;
+        }
+        jc.queue_owner = owner;
+        jc.queue_recorded = now;
+    }
+    ++jc.queue_decisions;
+    PadTrace::Record("COMPAT_BUFFER_DECISION",
+                     {static_cast<s64>(PadTrace::NextId()), decision, result,
+                      static_cast<s64>(compat_queue->aggregator),
+                      static_cast<s64>(compat_queue->descriptor), compat_queue->type, count,
+                      static_cast<s64>(owner), LiveDword(compat_queue->aggregator + 0x80),
+                      static_cast<s64>(CompatWord(compat_queue->aggregator + 0xa0)), policy,
+                      *reinterpret_cast<const u8*>(compat_queue->aggregator + 0x88),
+                      static_cast<s64>(jc.active)});
+    JcIdentity(compat_queue->descriptor);
+    if (jc.queue_decisions == 64) {
+        PadTrace::Record("COMPAT_BUFFER_LIMIT", {64});
+    }
+}
+
+u32 PS4_SYSV_ABI CompatBuffer(void* buffer, void* owner, void* event, void* first, void* second) {
+    if (!compat_enabled || compat_queue == nullptr ||
+        compat_queue->event != reinterpret_cast<u64>(event) ||
+        compat_queue->generation != compat.generation ||
+        compat_queue->aggregator != compat.aggregator ||
+        reinterpret_cast<u64>(buffer) != compat_queue->aggregator + 0x78) {
+        return native_buffer_event(buffer, owner, event, first, second);
+    }
+    CompatMemoryScope memory{"buffer_arbitration"};
+    const u64 address = reinterpret_cast<u64>(buffer);
+    u32 count = 0;
+    u32 capacity = 0;
+    if (!CompatRead(address + 8, &count, sizeof(count)) || count == 0 || count > 64 ||
+        !CompatRead(address + 12, &capacity, sizeof(capacity)) || capacity < count) {
+        return native_buffer_event(buffer, owner, event, first, second);
+    }
+    std::array<u64, 64> events{};
+    const u64 array = CompatWord(address);
+    if (array == 0 || !CompatRead(array, events.data(), count * sizeof(events[0]))) {
+        return native_buffer_event(buffer, owner, event, first, second);
+    }
+    bool only_held_gun = true;
+    for (u32 i = 0; i < count; ++i) {
+        u64 descriptor = 0;
+        u8 type = 255;
+        if (events[i] == 0 || !CompatRead(events[i] + 0x60, &descriptor, sizeof(descriptor)) ||
+            descriptor == 0 || !CompatRead(events[i] + 0x78, &type, sizeof(type))) {
+            return native_buffer_event(buffer, owner, event, first, second);
+        }
+        only_held_gun &= descriptor == compat_queue->gun_descriptor && type == 2;
+    }
+    u8 policy = 255;
+    if (!CompatRead(address + 0x10, &policy, sizeof(policy)) || policy > 2) {
+        return native_buffer_event(buffer, owner, event, first, second);
+    }
+    const u64 previous_owner = CompatWord(address + 0x28);
+    if (!compat_queue->attack && !only_held_gun) {
+        CompatQueueDecision(1, 0, count, previous_owner, policy);
+        return 0;
+    }
+    if (compat_queue->attack && only_held_gun && policy != 0) {
+        struct PolicyScope {
+            u8& value;
+            u8 previous;
+            explicit PolicyScope(u8& target) : value{target}, previous{target} {
+                value = 0;
+            }
+            ~PolicyScope() {
+                value = previous;
+            }
+        };
+        u32 accepted = 0;
+        {
+            PolicyScope policy_scope{*reinterpret_cast<u8*>(address + 0x10)};
+            accepted = native_buffer_event(buffer, owner, event, first, second);
+        }
+        CompatQueueDecision(2, accepted, count, previous_owner, policy);
+        return accepted;
+    }
+    return native_buffer_event(buffer, owner, event, first, second);
+}
+
 void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     if (!compat_enabled) {
         return compat_bool(object, frame, result);
@@ -2392,6 +2513,7 @@ void* CompatSelect(void* set, void* event) {
 }
 
 u32 CompatAggregate(void* object, void* event, u32 input) {
+    CompatQueueScope queue_scope;
     const u64 address = reinterpret_cast<u64>(event);
     bool observe_melee = false;
     u64 descriptor = 0;
@@ -2425,6 +2547,28 @@ u32 CompatAggregate(void* object, void* event, u32 input) {
             CompatHeld()) {
             compat.gun_descriptor = descriptor;
             compat.aggregator = reinterpret_cast<u64>(object);
+        }
+    }
+    if (event != nullptr && compat.gun != CompatGun::None && compat.gun_descriptor != 0 &&
+        reinterpret_cast<u64>(object) == compat.aggregator) {
+        CompatMemoryScope memory{"queue_context"};
+        if (compat.aggregator == CompatWord(compat.pawn + 0x930)) {
+            const u64 incoming = LiveWord(address + 0x60);
+            const u8 type = *reinterpret_cast<const u8*>(address + 0x78);
+            const bool held = type == 2 && incoming == compat.gun_descriptor;
+            const bool attack = type == 0 && (CompatName(incoming, "DVButton_GunSpecial") ||
+                                              CompatName(incoming, "DVButton_LightMelee") ||
+                                              CompatName(incoming, "DVButton_StrongMelee"));
+            if ((held || attack) && CompatPending()) {
+                queue_scope.event = address;
+                queue_scope.descriptor = incoming;
+                queue_scope.aggregator = compat.aggregator;
+                queue_scope.gun_descriptor = compat.gun_descriptor;
+                queue_scope.generation = compat.generation;
+                queue_scope.type = type;
+                queue_scope.attack = attack;
+                compat_queue = &queue_scope;
+            }
         }
     }
     const u32 accepted = native_aggregate_event(object, event, input);
@@ -3798,6 +3942,7 @@ void InstallNative() {
         !matches(base + 0xa20850, compat_select_bytes) ||
         !matches(base + 0xa26420, compat_match_bytes) ||
         !matches(base + 0xa1fe10, compat_select_bytes) ||
+        !matches(base + 0xa1c3c0, compat_let_bytes) ||
         !matches(base + 0xa20973, compat_link_layout)) {
         LOG_ERROR(Input, "[DMC COMPAT] Executable validation failed; experiment disabled");
         return;
@@ -3826,6 +3971,8 @@ void InstallNative() {
         base + 0xa1fe10, reinterpret_cast<u64>(&ObserveGraphEvent), compat_select_bytes));
     native_aggregate_event = reinterpret_cast<AggregateEvent>(NativeEntry(
         base + 0xa1f980, reinterpret_cast<u64>(&ObserveAggregateEvent), compat_let_bytes));
+    native_buffer_event = reinterpret_cast<BufferEvent>(
+        NativeEntry(base + 0xa1c3c0, reinterpret_cast<u64>(&CompatBuffer), compat_let_bytes));
     compat_bool = reinterpret_cast<Native>(
         NativeEntry(base + 0x55b90, reinterpret_cast<u64>(&CompatBool), bool_bytes));
     original.store(reinterpret_cast<Native>(NativeEntry(
@@ -3834,6 +3981,7 @@ void InstallNative() {
     compat_enabled = native_condition_dispatch != nullptr && native_match_event != nullptr &&
                      native_graph_event != nullptr && native_select_link != nullptr &&
                      compat_bool != nullptr && native_aggregate_event != nullptr &&
+                     native_buffer_event != nullptr &&
                      original.load(std::memory_order_acquire) != nullptr;
     LOG_INFO(Input,
              "[DMC COMPAT] Entry hooks installed={}; awaiting BoolVariable verification; no "

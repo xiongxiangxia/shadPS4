@@ -1,8 +1,16 @@
 # JC jump-cancel melee capture
 
-## Current playback baseline
+## Current native input-buffer arbitration
 
-The premature concurrent-charge experiments from d58a8b06/f6afb3f1 have been reverted after reports of missing shots/damage and lingering charge effects. This build restores the 8c8614fb source, including the 2a33477b compatibility behavior and the bounded GunSpecial observations below. The experimental Asleep detour, manual link execution and COMPAT_CONCURRENT records are not installed. JC retry remains disabled. The original GunSpecial/recharge timing issue remains unresolved; restoring this baseline is not a root-cause fix.
+The current candidate is based on the restored 8c8614fb playback behavior. It does not restore the forced Asleep/Awake route or manual link execution. One validated BufferEvent detour adjusts only competing pending inputs: new GunSpecial/LightMelee/StrongMelee Pressed may replace a queue containing solely the current gun's Held events through one original BufferEvent call, with its normal matching/conditions and ownership handling; the original strategy is restored before returning. Gun Held cannot overwrite a queue containing another descriptor or event type. Gun Released and mixed queues do not receive the attack-priority override. These changes require the same current player, gun intent, held input, no active charge flag, current synchronous event and matching intent generation. They do not alter action-node states, release/cleanup functions, projectiles or damage, and JC retry stays disabled.
+
+F9 adds up to 64 COMPAT_BUFFER_DECISION records per thread/capture, sharing the JC budget. Repeated decision 1 for the same old owner is sampled at most every 50ms. COMPAT_BUFFER_LIMIT means later decisions are unobserved. F9 off skips the new snapshots; ordinary per-intent milestones remain bounded.
+
+COMPAT_BUFFER_DECISION fields: record ID, decision (1 defer gun Held to preserve other queued input; 2 original attack-buffer admission with replacement enabled), native admission result (0 for decision 1), aggregate, incoming descriptor, incoming type, previous queue count, previous owner, queue count after the call/decision, owner after the call/decision, original strategy byte, restored strategy byte, current JC request if any. These are BufferEvent boundaries, not final aggregate boundaries, action execution, release completion, or damage confirmation. Event pointers are not retained; descriptor identity can appear in JC_OBJECT/JC_NAME. Unknown/unreadable layouts fall through without a compatibility decision.
+
+## Restored playback foundation
+
+The premature concurrent-charge experiments from d58a8b06/f6afb3f1 have been reverted after reports of missing shots/damage and lingering charge effects. The playback foundation is 8c8614fb, including the 2a33477b charge-intent behavior and the bounded GunSpecial observations below; the current candidate adds only the buffer arbitration described above. The experimental Asleep detour, manual link execution and COMPAT_CONCURRENT records are not installed. JC retry remains disabled. This remains a compatibility experiment, not a root-cause fix.
 
 ## Current GunSpecial investigation
 
