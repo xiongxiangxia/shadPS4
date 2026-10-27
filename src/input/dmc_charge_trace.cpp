@@ -1038,6 +1038,8 @@ struct JcCapture {
     u32 gun_states = 0;
     u32 gun_nodes = 0;
     u32 queue_decisions = 0;
+    u32 charge_modes = 0;
+    u64 charge_mode_intent = 0;
     u64 queue_owner = 0;
     std::chrono::steady_clock::time_point queue_recorded{};
     u64 gun_request = 0;
@@ -2343,18 +2345,45 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
     const bool original_weapon =
         selection_condition && outer == compat.candidate && outer != 0 &&
         CompatClass(address, "DVActionGraph_ConditionDef_SelectedRangedWeapon");
-    if (root_token || original_weapon) {
+    u8 requested_mode = 255;
+    u8 current_mode = 255;
+    bool original_mode = false;
+    if (selection_condition && caller == guest_base + 0xa235b9 && outer == compat.candidate &&
+        outer != 0 && CompatClass(address, "DVActionGraph_ConditionDef_PlayMode")) {
+        const u32 offset = CompatOffset(address, "PlayMode");
+        original_mode =
+            offset != 0 && compat.mode_offset != 0 &&
+            CompatRead(address + offset, &requested_mode, sizeof(requested_mode)) &&
+            requested_mode == 0 &&
+            CompatRead(compat.pawn + compat.mode_offset, &current_mode, sizeof(current_mode)) &&
+            (current_mode == 1 || current_mode == 2);
+    }
+    if (root_token || original_weapon || original_mode) {
         u32 previous = 0;
         std::memcpy(&previous, static_cast<u8*>(parameters) + 24, sizeof(previous));
         const u32 accepted = 1;
         std::memcpy(static_cast<u8*>(parameters) + 24, &accepted, sizeof(accepted));
-        const u32 bit = graph_condition ? 256 : 512;
+        const u32 bit = original_mode ? 8192 : graph_condition ? 256 : 512;
         if (previous == 0 && (compat.milestones & bit) == 0) {
             compat.milestones |= bit;
             LOG_INFO(Input,
                      "[DMC COMPAT] Charge condition override: graph_preselection={}, "
-                     "root_token={}, original_weapon={}",
-                     graph_condition, root_token, original_weapon);
+                     "root_token={}, original_weapon={}, held_charge_mode={}",
+                     graph_condition, root_token, original_weapon, original_mode);
+        }
+        if (original_mode && previous == 0 && PadTrace::Enabled() && JcBudget() &&
+            jc.charge_mode_intent != compat.generation && jc.charge_modes < 16) {
+            jc.charge_mode_intent = compat.generation;
+            ++jc.charge_modes;
+            PadTrace::Record("COMPAT_CHARGE_MODE",
+                             {static_cast<s64>(PadTrace::NextId()), static_cast<s64>(address),
+                              static_cast<s64>(outer), static_cast<s64>(compat.pawn),
+                              static_cast<s64>(compat.gun), requested_mode, current_mode, previous,
+                              accepted, static_cast<s64>(compat.generation),
+                              static_cast<s64>(compat.gun_descriptor), type});
+            if (jc.charge_modes == 16) {
+                PadTrace::Record("COMPAT_CHARGE_MODE_LIMIT", {16});
+            }
         }
     }
 }

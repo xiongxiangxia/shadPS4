@@ -1,5 +1,11 @@
 # JC jump-cancel melee capture
 
+## Held charge across a play-mode change
+
+The current candidate retains d7c3f399 buffer arbitration and adds a narrow correction to the actual-pawn PlayMode condition on an already-matched charge link. It applies only to an existing held-gun charge intent for the same player, gun event type Held, no active charge flag, a reflected requirement Normal=0, and current pawn mode Demon=1 or Angel=2. It changes the condition result, not the pawn mode, node state, input buttons, release or cleanup functions. A fresh grapple input made while a mode trigger is already held does not arm the compatibility intent. Other requirements and unknown/unreadable modes remain unchanged.
+
+F9 may add COMPAT_CHARGE_MODE once per intent and at most 16 times per thread/capture, sharing the JC budget: record ID, condition object, matched link definition, pawn, compatibility gun enum (1 pistols/2 shotgun), required mode, actual pawn mode, original condition result, overridden result, intent generation, gun descriptor, event type. COMPAT_CHARGE_MODE_LIMIT means later overrides are unobserved. The record is emitted only when the original condition rejects and this correction applies; missing records do not prove a mode condition passed. Ordinary held_charge_mode=true milestones are bounded per intent. There is no new hook or repeated metadata walk.
+
 ## Current native input-buffer arbitration
 
 The current candidate is based on the restored 8c8614fb playback behavior. It does not restore the forced Asleep/Awake route or manual link execution. One validated BufferEvent detour adjusts only competing pending inputs: new GunSpecial/LightMelee/StrongMelee Pressed may replace a queue containing solely the current gun's Held events through one original BufferEvent call, with its normal matching/conditions and ownership handling; the original strategy is restored before returning. Gun Held cannot overwrite a queue containing another descriptor or event type. Gun Released and mixed queues do not receive the attack-priority override. These changes require the same current player, gun intent, held input, no active charge flag, current synchronous event and matching intent generation. They do not alter action-node states, release/cleanup functions, projectiles or damage, and JC retry stays disabled.
