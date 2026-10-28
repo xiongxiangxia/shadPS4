@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #ifdef ENABLE_DMC_CHARGE_COMPAT
 #include <unordered_map>
 #endif
@@ -3764,6 +3765,8 @@ void* NativeEntry(u64 address, u64 observer, const std::array<u8, Size>& expecte
     return trampoline;
 }
 
+#include "input/dmc_charge_light.inl"
+
 void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     const auto handler = original.load(std::memory_order_acquire);
     if (!PadTrace::Enabled()) {
@@ -3942,6 +3945,14 @@ void InstallNative() {
         return;
     }
     guest_base = base;
+#ifndef ENABLE_DMC_CHARGE_COMPAT
+    const char* trace_mode = std::getenv("SHADPS4_DMC_TRACE");
+    LightTrace::selected = trace_mode == nullptr || std::strcmp(trace_mode, "full") != 0;
+    if (LightTrace::selected) {
+        LightTrace::Install(base);
+        return;
+    }
+#endif
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     const char* compatibility = std::getenv("SHADPS4_DMC_COMPAT");
     if (compatibility != nullptr && std::strcmp(compatibility, "0") == 0) {
@@ -4127,6 +4138,12 @@ void Install() {
     return;
 #endif
     capture_generation.fetch_add(1, std::memory_order_relaxed);
+#ifndef ENABLE_DMC_CHARGE_COMPAT
+    if (LightTrace::selected) {
+        LightTrace::Begin();
+        return;
+    }
+#endif
     PadTrace::Record("DMC_NATIVE_HOOK", {native_held != nullptr, native_clear != nullptr});
     PadTrace::Record("DMC_AGG_HOOK",
                      {native_aggregate_event != nullptr, native_aggregate_clear != nullptr,

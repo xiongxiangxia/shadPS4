@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - edition: ROOTCAUSE-diagnostic
+          - edition: ROOTCAUSE-light-timing
             compatibility: 'OFF'
           - edition: COMPAT-experimental
             compatibility: 'ON'
@@ -48,6 +48,9 @@ jobs:
             Copy-Item tools\dmc-compat-off.cmd package\
             Copy-Item tools\dmc-jc-off.cmd package\
           } else {
+            Copy-Item documents\DMC-LIGHT-capture.md package\LIGHT-CAPTURE.md
+            Copy-Item tools\dmc-root-light.cmd package\
+            Copy-Item tools\dmc_light_summary.py package\
             Copy-Item documents\PADTRACE-v2.md package\PADTRACE-v2.md
             Copy-Item tools\padtrace_summary.py package\padtrace_summary.py
           }
