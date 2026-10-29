@@ -5,7 +5,7 @@ name: Build and Release
 
 on:
   push:
-    branches-ignore: [Pre-release-shadPS4-*, padtrace-v2]
+    branches-ignore: [Pre-release-shadPS4-*, padtrace-v2, dmc-camera-2p5x]
     paths-ignore:
       - "documents/**"
       - "**/*.md"

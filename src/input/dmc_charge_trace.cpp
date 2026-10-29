@@ -3764,6 +3764,8 @@ void* NativeEntry(u64 address, u64 observer, const std::array<u8, Size>& expecte
     return trampoline;
 }
 
+#include "input/dmc_camera_speed.inl"
+
 void PS4_SYSV_ABI ObserveLet(void* object, void* frame, void* result) {
     const auto handler = original.load(std::memory_order_acquire);
     if (!PadTrace::Enabled()) {
@@ -3942,6 +3944,9 @@ void InstallNative() {
         return;
     }
     guest_base = base;
+#ifdef ENABLE_DMC_CAMERA_SPEED
+    CameraSpeed::Install(base);
+#endif
 #ifdef ENABLE_DMC_CHARGE_COMPAT
     const char* compatibility = std::getenv("SHADPS4_DMC_COMPAT");
     if (compatibility != nullptr && std::strcmp(compatibility, "0") == 0) {
