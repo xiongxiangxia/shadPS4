@@ -1240,10 +1240,8 @@ set(INPUT src/input/controller.cpp
           src/input/input_handler.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
-          src/input/pad_trace.cpp
-          src/input/pad_trace.h
-          src/input/dmc_charge_trace.cpp
-          src/input/dmc_charge_trace.h
+          src/input/dmc_play.cpp
+          src/input/dmc_play.h
 )
 
 set(EMULATOR src/emulator.cpp
@@ -1318,23 +1316,17 @@ else()
 endif()
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
-option(ENABLE_PADTRACE "Build asynchronous input diagnostics" OFF)
-option(ENABLE_DMC_CHARGE_COMPAT "Build the opt-in DmC charge compatibility experiment" OFF)
-option(ENABLE_DMC_CAMERA_SPEED "Build the DmC manual camera speed experiment" OFF)
-if(ENABLE_DMC_CAMERA_SPEED)
-    if(NOT WIN32 OR NOT ENABLE_PADTRACE OR NOT ENABLE_DMC_CHARGE_COMPAT)
-        message(FATAL_ERROR "DmC camera speed requires Windows, PADTRACE and charge compatibility")
+option(ENABLE_DMC_PLAY "Build the DmC charge and camera play edition" OFF)
+set(DMC_CAMERA_MULTIPLIER "3.0" CACHE STRING "DmC manual camera speed multiplier")
+if(ENABLE_DMC_PLAY)
+    if(NOT WIN32)
+        message(FATAL_ERROR "DmC play edition requires Windows")
     endif()
-    target_compile_definitions(shadps4 PRIVATE ENABLE_DMC_CAMERA_SPEED)
-endif()
-if(ENABLE_DMC_CHARGE_COMPAT)
-    if(NOT WIN32 OR NOT ENABLE_PADTRACE)
-        message(FATAL_ERROR "DmC compatibility requires Windows and ENABLE_PADTRACE")
+    if(NOT DMC_CAMERA_MULTIPLIER MATCHES "^(3\\.0|3\\.5)$")
+        message(FATAL_ERROR "DmC play camera multiplier must be 3.0 or 3.5")
     endif()
-    target_compile_definitions(shadps4 PRIVATE ENABLE_DMC_CHARGE_COMPAT)
-endif()
-if(ENABLE_PADTRACE)
-    target_compile_definitions(shadps4 PRIVATE ENABLE_PADTRACE)
+    target_compile_definitions(shadps4 PRIVATE ENABLE_DMC_PLAY
+                              DMC_CAMERA_MULTIPLIER=${DMC_CAMERA_MULTIPLIER}f)
 endif()
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 

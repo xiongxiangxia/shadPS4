@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#ifdef ENABLE_DMC_CAMERA_SPEED
+#ifdef ENABLE_DMC_PLAY
 namespace CameraSpeed {
+constexpr float multiplier = DMC_CAMERA_MULTIPLIER;
+static_assert(multiplier == 3.0f || multiplier == 3.5f);
 template <std::size_t Size>
 u8* Prepare(u64 address, const std::array<u8, Size>& expected, std::size_t split,
             std::array<u8, 8> multiply) {
@@ -19,8 +21,7 @@ u8* Prepare(u64 address, const std::array<u8, Size>& expected, std::size_t split
     std::memcpy(code + split, multiply.data(), multiply.size());
     std::memcpy(code + split + multiply.size(), expected.data() + split, Size - split);
     AbsoluteJump(code + Size + multiply.size(), address + Size);
-    constexpr float factor = 2.5f;
-    std::memcpy(code + constant_offset, &factor, sizeof(factor));
+    std::memcpy(code + constant_offset, &multiplier, sizeof(multiplier));
     DWORD previous = 0;
     if (!VirtualProtect(code, allocation_size, PAGE_EXECUTE_READ, &previous)) {
         VirtualFree(code, 0, MEM_RELEASE);
@@ -36,11 +37,6 @@ void Install(u64 base) {
         return;
     }
     attempted = true;
-    const char* setting = std::getenv("SHADPS4_DMC_CAMERA_SPEED");
-    if (setting != nullptr && std::strcmp(setting, "0") == 0) {
-        LOG_INFO(Input, "[DMC CAMERA] Original camera speed requested");
-        return;
-    }
     constexpr u64 yaw_offset = 0x9b5eac;
     constexpr u64 pitch_offset = 0x9ae354;
     constexpr std::array<u8, 21> yaw{0xc5, 0xda, 0x59, 0xc9, 0xc5, 0xf2, 0x59,
@@ -109,9 +105,7 @@ void Install(u64 base) {
     }
     FlushInstructionCache(GetCurrentProcess(), yaw_site, yaw.size());
     FlushInstructionCache(GetCurrentProcess(), pitch_site, pitch.size());
-    LOG_INFO(Input,
-             "[DMC CAMERA] Manual yaw/pitch speed x2.5 installed; original limits and game time "
-             "preserved; SHADPS4_DMC_CAMERA_SPEED=0 restores default on next launch");
+    LOG_INFO(Input, "[DMC PLAY] Manual yaw/pitch speed x{} installed", multiplier);
 }
 } // namespace CameraSpeed
 #endif

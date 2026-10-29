@@ -28,7 +28,6 @@
 #include "imgui/big_picture/settings_dialog_layer.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
-#include "input/pad_trace.h"
 
 namespace Input {
 /*
@@ -362,11 +361,6 @@ void ParseInputConfig(const std::string game_id = "") {
         EmulatorSettings.IsUseUnifiedInputConfig() ? "default" : game_id;
     const auto config_file = GetInputConfigFile(game_id_or_default);
     const auto global_config_file = GetInputConfigFile("global");
-    if (PadTrace::Enabled()) {
-        PadTrace::Configuration(fmt::format("game={} input={} global={}", game_id,
-                                            Common::FS::PathToUTF8String(config_file),
-                                            Common::FS::PathToUTF8String(global_config_file)));
-    }
 
     // we reset these here so in case the user fucks up or doesn't include some of these,
     // we can fall back to default
@@ -619,12 +613,6 @@ void ParseInputConfig(const std::string game_id = "") {
     std::sort(connections.begin(), connections.end());
     for (auto& c : connections) {
         LOG_DEBUG(Input, "Binding: {} : {}", c.output->ToString(), c.binding.ToString());
-        if (PadTrace::Enabled()) {
-            PadTrace::Configuration(
-                fmt::format("{} : {}", c.output->ToString(), c.binding.ToString()));
-            LOG_INFO(Input, "[PADTRACE CONFIG] Binding: {} : {}", c.output->ToString(),
-                     c.binding.ToString());
-        }
     }
     LOG_DEBUG(Input, "Done parsing the input config!");
 }
@@ -739,11 +727,6 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         }
     };
     state_changed = old_button_state != new_button_state || old_param != *new_param;
-    if (state_changed || old_button_state || new_button_state || old_param || *new_param) {
-        PadTrace::Record("MAP_OUTPUT", {static_cast<s64>(PadTrace::CurrentEvent()), gamepad_index,
-                                        button, axis, positive_axis, old_button_state,
-                                        new_button_state, old_param, *new_param, state_changed});
-    }
     if (!state_changed) {
         return;
     }
@@ -1012,8 +995,6 @@ InputEvent BindingConnection::ProcessBinding() {
 }
 
 void ActivateOutputsFromInputs() {
-    PadTrace::Record("MAP_BEGIN", {static_cast<s64>(PadTrace::CurrentEvent()),
-                                   static_cast<s64>(pressed_keys.size())});
 
     // todo find a better solution
     for (int i = 0; i < output_arrays.size(); i++) {
@@ -1033,19 +1014,7 @@ void ActivateOutputsFromInputs() {
         for (auto& it : connections) {
             // only update this when it's the correct pass
             if (it.output->gamepad_id == i) {
-                const auto event = it.ProcessBinding();
-                if (event.active || it.output->old_button_state || it.output->old_param) {
-                    PadTrace::Record(
-                        "BINDING",
-                        {static_cast<s64>(PadTrace::CurrentEvent()), i, it.output->button,
-                         it.output->axis, it.output->positive_axis, event.active, event.axis_value,
-                         static_cast<s64>(it.binding.keys[0].type), it.binding.keys[0].sdl_id,
-                         it.binding.keys[0].gamepad_id, static_cast<s64>(it.binding.keys[1].type),
-                         it.binding.keys[1].sdl_id, it.binding.keys[1].gamepad_id,
-                         static_cast<s64>(it.binding.keys[2].type), it.binding.keys[2].sdl_id,
-                         it.binding.keys[2].gamepad_id});
-                }
-                it.output->AddUpdate(event);
+                it.output->AddUpdate(it.ProcessBinding());
             }
         }
 
@@ -1054,7 +1023,6 @@ void ActivateOutputsFromInputs() {
             it.FinalizeUpdate(i);
         }
     }
-    PadTrace::Record("MAP_END", {static_cast<s64>(PadTrace::CurrentEvent())});
 }
 
 } // namespace Input

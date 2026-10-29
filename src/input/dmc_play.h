@@ -3,7 +3,6 @@
 
 #pragma once
 
-namespace Input::DmcChargeTrace {
-void InstallNative();
+namespace Input::DmcPlay {
 void Install();
-} // namespace Input::DmcChargeTrace
+}

@@ -66,8 +66,6 @@ public:
 
     Libraries::Pad::OrbisPadButtonDataOffset buttonsState{};
     u64 time = 0;
-    u64 trace_id = 0;
-    u64 trace_event = 0;
     AxisArray<s32> axes{axis_defaults};
     TouchpadEntry touchpad[2]{};
     Libraries::Pad::OrbisFVector3 acceleration = {0.0f, -9.81f, 0.0f};
@@ -127,7 +125,6 @@ private:
 
     std::mutex m_state_mutex;
     RingBufferQueue<State> m_states_queue;
-    u32 m_trace_queue_size = 0;
 };
 
 class GameControllers {

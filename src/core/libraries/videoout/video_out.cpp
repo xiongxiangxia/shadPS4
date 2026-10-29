@@ -11,7 +11,6 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
-#include "input/pad_trace.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -154,7 +153,6 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
-    Input::PadTrace::Record("FLIP_SUBMIT", {handle, bufferIndex, flipMode, flipArg});
     auto* port = driver->GetPort(handle);
     if (!port) {
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);
@@ -260,13 +258,6 @@ s32 PS4_SYSV_ABI sceVideoOutGetFlipStatus(s32 handle, FlipStatus* status) {
         *status = port->flip_status;
     }
 
-    Input::PadTrace::Record("FLIP_STATUS",
-                            {handle, static_cast<s64>(status->count),
-                             static_cast<s64>(status->process_time), static_cast<s64>(status->tsc),
-                             static_cast<s64>(status->submit_tsc), status->flip_arg,
-                             status->gc_queue_num, status->flip_pending_num, status->current_buffer,
-                             reinterpret_cast<s64>(__builtin_return_address(0))});
-
     LOG_TRACE(Lib_VideoOut,
               "count = {}, processTime = {}, tsc = {}, submitTsc = {}, flipArg = {}, gcQueueNum = "
               "{}, flipPendingNum = {}, currentBuffer = {}",
@@ -290,10 +281,6 @@ s32 PS4_SYSV_ABI sceVideoOutGetVblankStatus(int handle, SceVideoOutVblankStatus*
 
     std::unique_lock lock{port->vo_mutex};
     *status = port->vblank_status;
-    Input::PadTrace::Record("VBLANK_STATUS",
-                            {handle, static_cast<s64>(status->count),
-                             static_cast<s64>(status->process_time), static_cast<s64>(status->tsc),
-                             reinterpret_cast<s64>(__builtin_return_address(0))});
     return ORBIS_OK;
 }
 
@@ -392,9 +379,7 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
 
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
-    Input::PadTrace::Record("VBLANK_WAIT", {handle, static_cast<s64>(prev_counter)});
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });
-    Input::PadTrace::Record("VBLANK_WAKE", {handle, static_cast<s64>(port->vblank_status.count)});
     return ORBIS_OK;
 }
 

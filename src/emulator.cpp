@@ -45,8 +45,7 @@
 #include "core/memory.h"
 #include "core/user_settings.h"
 #include "emulator.h"
-#include "input/dmc_charge_trace.h"
-#include "input/pad_trace.h"
+#include "input/dmc_play.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
@@ -92,7 +91,6 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
-    Input::PadTrace::Shutdown();
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();
@@ -597,7 +595,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
-    Input::PadTrace::Initialize();
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);
@@ -706,7 +703,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         });
     }
 
-    Input::DmcChargeTrace::InstallNative();
+    Input::DmcPlay::Install();
     linker->Execute(args);
 
     window->InitTimers();
