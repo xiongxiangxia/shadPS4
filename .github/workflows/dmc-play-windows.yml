@@ -35,7 +35,7 @@ jobs:
         with:
           arch: x64
       - name: Configure play executable
-        run: cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_DMC_PLAY=ON -DDMC_CAMERA_MULTIPLIER=${{ matrix.multiplier }}
+        run: cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DENABLE_DMC_PLAY=ON "-DDMC_CAMERA_MULTIPLIER=${{ matrix.multiplier }}"
       - name: Compile play module first
         run: cmake --build build --target CMakeFiles/shadps4.dir/src/input/dmc_play.cpp.obj
       - name: Build executable
