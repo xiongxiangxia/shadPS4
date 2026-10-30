@@ -662,14 +662,17 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
         return;
     }
 
-    u32 buffered = 0;
     const auto now = std::chrono::steady_clock::now();
     const bool pending = CompatPending();
+    if (!pending || now - compat.last_retry < std::chrono::milliseconds{100}) {
+        return;
+    }
 
+    u32 buffered = 0;
     bool buffered_gun = false;
-    const bool readable = pending && CompatBufferedGun(buffered, buffered_gun);
+    const bool readable = CompatBufferedGun(buffered, buffered_gun);
 
-    if (readable && !buffered_gun && now - compat.last_retry >= std::chrono::milliseconds{100}) {
+    if (readable && !buffered_gun) {
         u32 consumed = 0;
         std::memcpy(&consumed, result, sizeof(consumed));
         if (consumed == 0) {
