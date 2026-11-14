@@ -27,6 +27,8 @@ struct EvadePress {
     u64 event;
     u8 mode;
     const char* outcome = "angel buffer graph not reached";
+    bool reached_selector = false;
+    bool skipped_buffer_check = false;
 };
 
 thread_local EvadePress* evade_press = nullptr;
@@ -119,7 +121,7 @@ u32 PS4_SYSV_ABI Graph(void* graph, void* event) {
     const auto addr = reinterpret_cast<u64>(graph);
     const auto ev = reinterpret_cast<u64>(event);
     if (evade_press == nullptr || evade_press->event != ev || addr != angel_buffer.graph ||
-        pending_gate_flag != nullptr ||
+        pending_gate_event != 0 ||
         reinterpret_cast<u64>(__builtin_return_address(0)) - guest_base != 0xa1fb69 ||
         LiveWord(addr + 0x78) != evade_press->aggregator) {
         return graph_event(graph, event);
@@ -137,14 +139,58 @@ u32 PS4_SYSV_ABI Graph(void* graph, void* event) {
     pending_gate_flag = reinterpret_cast<u8*>(addr + 0x90);
     *pending_gate_flag &= 0xfe;
     const u32 accepted = graph_event(graph, event);
-    const bool checked_conditions = pending_gate_flag == nullptr;
     RestoreBufferingGate();
     pending_gate_event = 0;
-    auto& outcome = evade_press->outcome;
-    outcome = accepted             ? "native accepted"
-              : checked_conditions ? "native declined"
-                                   : "root not evaluated";
+    evade_press->outcome = accepted ? "native accepted" : "native declined";
     return accepted;
+}
+
+bool DispatchRootCondition(void* object, void* function, void* parameters, void* result,
+                           u64 caller) {
+    if (pending_gate_event == 0 || parameters == nullptr ||
+        (caller != guest_base + 0xa1fee9 && caller != guest_base + 0xa2090c) ||
+        LiveWord(reinterpret_cast<u64>(parameters)) != pending_gate_event) {
+        return false;
+    }
+    if (caller == guest_base + 0xa1fee9) {
+        RestoreBufferingGate();
+    }
+    const auto address = reinterpret_cast<u64>(object);
+    if (!CompatName(LiveWord(address + 0x40), "EvadeGraphRoot") ||
+        !CompatClass(address, "DVActionGraph_ConditionDef_Token") ||
+        !CompatNameIndex(static_cast<u32>(LiveWord(address + 0x60)), "EvadesDenied")) {
+        return false;
+    }
+    const u32 offset = CompatOffset(address, "m_AdditionalTokenChecks");
+    if (offset == 0 || LiveDword(address + offset + 8) != 1) {
+        return false;
+    }
+    const u64 checks = LiveWord(address + offset);
+    u64 token = 0;
+    u32 has_token = 1;
+    if (checks == 0 || !CompatRead(checks, &token, sizeof(token)) || token != angel_buffer.token ||
+        !CompatRead(checks + 8, &has_token, sizeof(has_token)) || has_token != 0) {
+        return false;
+    }
+
+    // The singleton array only requires EvadesBuffer to be absent. Preserve the native
+    // EvadesDenied check and leave the live token and its callbacks in place.
+    const u32 empty = 0;
+    const u32 count = 1;
+    auto* count_field = reinterpret_cast<void*>(address + offset + 8);
+    std::memcpy(count_field, &empty, sizeof(empty));
+    native_condition_dispatch(object, function, parameters, result);
+    std::memcpy(count_field, &count, sizeof(count));
+    evade_press->skipped_buffer_check = true;
+    return true;
+}
+
+void BeforeSelect(void* event, u64 caller) {
+    if (pending_gate_event != 0 && reinterpret_cast<u64>(event) == pending_gate_event &&
+        caller == guest_base + 0xa1ffcb) {
+        RestoreBufferingGate();
+        evade_press->reached_selector = true;
+    }
 }
 
 bool IsAngelEvadeOwner(u64 owner) {
@@ -208,8 +254,10 @@ u32 Aggregate(void* object, void* input_event, u32 input, u32 (*original)(void*,
     const u32 accepted = original(object, input_event, input);
     evade_press = previous;
     if (diagnostic_lines < 48) {
-        Record("press mode={} {} graph_known={} aggregate_accepted={} buffered={}", mode,
-               press.outcome, angel_buffer.graph != 0, accepted, LiveDword(aggregator + 0x80));
+        Record("press mode={} {} graph_known={} skipped_buffer_check={} selector={} "
+               "aggregate_accepted={} buffered={}",
+               mode, press.outcome, angel_buffer.graph != 0, press.skipped_buffer_check,
+               press.reached_selector, accepted, LiveDword(aggregator + 0x80));
     }
     return accepted;
 }

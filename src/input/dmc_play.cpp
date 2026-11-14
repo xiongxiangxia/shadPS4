@@ -707,10 +707,8 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
 void CompatDispatch(void* object, void* function, void* parameters, void* result, u64 caller) {
     const u64 address = reinterpret_cast<u64>(object);
 #ifdef ENABLE_DMC_EVADE_TRACE
-    if (EvadeTrace::pending_gate_flag != nullptr && caller == guest_base + 0xa1fee9 &&
-        parameters != nullptr &&
-        LiveWord(reinterpret_cast<u64>(parameters)) == EvadeTrace::pending_gate_event) {
-        EvadeTrace::RestoreBufferingGate();
+    if (EvadeTrace::DispatchRootCondition(object, function, parameters, result, caller)) {
+        return;
     }
 #endif
     native_condition_dispatch(object, function, parameters, result);
@@ -926,6 +924,9 @@ u32 PS4_SYSV_ABI Match(void* definition, void* event) {
     return compat_enabled ? CompatMatch(definition, event) : native_match_event(definition, event);
 }
 void* PS4_SYSV_ABI Select(void* set, void* event) {
+#ifdef ENABLE_DMC_EVADE_TRACE
+    EvadeTrace::BeforeSelect(event, reinterpret_cast<u64>(__builtin_return_address(0)));
+#endif
     return compat_enabled ? CompatSelect(set, event) : native_select_link(set, event);
 }
 u32 PS4_SYSV_ABI Aggregate(void* object, void* event, u32 input) {
