@@ -76,6 +76,37 @@ bool TrackedToken(u64 token) {
            CompatNameIndex(index, "JumpsDenied");
 }
 
+s32 TokenCount(u64 manager, u64 token) {
+    std::array<u64, 10> header{};
+    if (manager == 0 || !CompatRead(manager + 0x60, header.data(), sizeof(header))) {
+        return -1;
+    }
+    const u32 buckets = static_cast<u32>(header[9]);
+    if (buckets == 0) {
+        return 0;
+    }
+    if (buckets > 65536 || (buckets & (buckets - 1)) != 0 || (header[8] == 0 && buckets > 2)) {
+        return -1;
+    }
+    const u64 hash = header[8] != 0 ? header[8] : manager + 0x98;
+    s32 index = -1;
+    if (!CompatRead(hash + (static_cast<u32>(token) & (buckets - 1)) * 4, &index, sizeof(index))) {
+        return -1;
+    }
+    for (u32 steps = 0; index != -1 && steps < 16; ++steps) {
+        std::array<u64, 10> entry{};
+        if (index < 0 || index >= 4096 || header[0] == 0 ||
+            !CompatRead(header[0] + static_cast<u64>(index) * 0x50, entry.data(), sizeof(entry))) {
+            return -1;
+        }
+        if (entry[0] == token) {
+            return static_cast<s32>(entry[2]);
+        }
+        index = static_cast<s32>(entry[9]);
+    }
+    return index == -1 ? 0 : -1;
+}
+
 const char* Button(u64 event) {
     const u64 descriptor = CompatWord(event + 0x60);
     if (CompatName(descriptor, "DVButton_Evade")) {
@@ -173,8 +204,10 @@ void Condition(u64 condition, void* parameters, u64 caller) {
                           : 0;
     const auto token_name = Name(token);
     const auto owner = ObjectName(CompatWord(condition + 0x40));
-    Record("condition event={:#x} class={} owner={} token={} pass={}", capture.event, name.data(),
-           owner.data(), token_name.data(), LiveDword(params + 24));
+    const u64 pawn = CompatWord(params + 16);
+    const s32 count = token != 0 && pawn != 0 ? TokenCount(CompatWord(pawn + 0x9c0), token) : -1;
+    Record("condition event={:#x} class={} owner={} token={} count={} pass={}", capture.event,
+           name.data(), owner.data(), token_name.data(), count, LiveDword(params + 24));
 }
 
 void Match(u64 definition, u64 event, u32 matched) {
@@ -192,17 +225,15 @@ void Match(u64 definition, u64 event, u32 matched) {
            owner.data(), id >> 32, name.data(), matched, mode, LiveDword(event + 0x68));
 }
 
-void Buffer(u64 buffer, u64 event, u32 accepted) {
+const char* BufferButton(u64 buffer, u64 event) {
     if (!Active() || event == 0 || buffer != capture.aggregator + 0x78) {
-        return;
+        return nullptr;
     }
     u8 type = 255;
     if (CompatRead(event + 0x78, &type, sizeof(type)) && type == 0 && IsInput(event)) {
-        if (const char* button = Button(event)) {
-            Record("buffer button={} event={:#x} accepted={} count={}", button, event, accepted,
-                   LiveDword(buffer + 8));
-        }
+        return Button(event);
     }
+    return nullptr;
 }
 
 void Token(const char* operation, u64 manager, u64 token, u64 owner, u64 caller) {
@@ -212,8 +243,8 @@ void Token(const char* operation, u64 manager, u64 token, u64 owner, u64 caller)
     }
     const auto name = Name(token);
     const auto owner_name = Name(owner);
-    Record("token {} name={} owner={} caller={:#x}", operation, name.data(), owner_name.data(),
-           caller - guest_base);
+    Record("token {} name={} owner={} count_after={} caller={:#x}", operation, name.data(),
+           owner_name.data(), TokenCount(manager, token), caller - guest_base);
 }
 
 void PS4_SYSV_ABI Create(void* manager, u64 token, u64 owner) {

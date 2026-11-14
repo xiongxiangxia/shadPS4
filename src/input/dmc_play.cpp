@@ -925,8 +925,14 @@ u32 PS4_SYSV_ABI Aggregate(void* object, void* event, u32 input) {
 
 #ifdef ENABLE_DMC_EVADE_TRACE
 u32 PS4_SYSV_ABI TraceBuffer(void* buffer, void* owner, void* event, void* first, void* second) {
+    const auto address = reinterpret_cast<u64>(buffer);
+    const auto ev = reinterpret_cast<u64>(event);
+    const char* button = EvadeTrace::BufferButton(address, ev);
     const u32 accepted = CompatBuffer(buffer, owner, event, first, second);
-    EvadeTrace::Buffer(reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(event), accepted);
+    if (button != nullptr) {
+        EvadeTrace::Record("buffer button={} event={:#x} accepted={} count={}", button, ev,
+                           accepted, LiveDword(address + 8));
+    }
     return accepted;
 }
 #endif
