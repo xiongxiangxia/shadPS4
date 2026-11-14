@@ -4,19 +4,32 @@
 #ifdef ENABLE_DMC_EVADE_TRACE
 namespace EvadeTrace {
 using TokenOperation = void(PS4_SYSV_ABI*)(void*, u64, u64);
+using BufferCallback = void(PS4_SYSV_ABI*)(void*, void*, void*);
 
 GraphEvent graph_event = nullptr;
 TokenOperation create_token = nullptr;
 TokenOperation delete_token = nullptr;
+BufferCallback set_buffer = nullptr;
 bool installed = false;
 
 struct AngelEvadeBuffer {
     u64 manager = 0;
     u64 token = 0;
     u64 owner = 0;
+    u64 graph = 0;
 };
 
 thread_local AngelEvadeBuffer angel_buffer;
+thread_local AngelEvadeBuffer* creating_buffer = nullptr;
+
+struct EvadePress {
+    u64 aggregator;
+    u64 event;
+    u8 mode;
+    const char* outcome = "angel buffer graph not reached";
+};
+
+thread_local EvadePress* evade_press = nullptr;
 thread_local u64 pending_gate_event = 0;
 thread_local u8* pending_gate_flag = nullptr;
 thread_local u32 diagnostic_lines = 0;
@@ -79,31 +92,17 @@ bool IsInput(u64 event) {
     return false;
 }
 
-bool IsEvadeRoot(u64 graph) {
-    const u64 conditions = CompatWord(graph + 0x68);
-    if (conditions == 0 || LiveDword(conditions + 0x70) == 0) {
-        return false;
-    }
-    const u64 list = CompatWord(conditions + 0x68);
-    const u64 first = list != 0 ? CompatWord(list) : 0;
-    return first != 0 && CompatName(CompatWord(first + 0x40), "EvadeGraphRoot") &&
-           CompatNameIndex(static_cast<u32>(CompatWord(first + 0x60)), "EvadesDenied");
-}
-
-const char* BlockedAerialEvade(u64 aggregator, u64 event) {
+const char* BlockedAerialEvade(const EvadePress& press) {
     if (angel_buffer.token == 0 || angel_buffer.manager != CompatWord(compat.pawn + 0x9c0) ||
         TokenCount(angel_buffer.manager, angel_buffer.token) != 1) {
         return "no sole angel buffer";
     }
-    if (LiveDword(aggregator + 0x80) != 0) {
+    if (LiveDword(press.aggregator + 0x80) != 0) {
         return "input already buffered";
     }
     u8 mode = 255;
-    u8 event_mode = 255;
     if (compat.mode_offset == 0 ||
-        !CompatRead(compat.pawn + compat.mode_offset, &mode, sizeof(mode)) ||
-        !CompatRead(event + 0x90, &event_mode, sizeof(event_mode)) || mode > 1 ||
-        event_mode != mode) {
+        !CompatRead(compat.pawn + compat.mode_offset, &mode, sizeof(mode)) || mode != press.mode) {
         return "play mode";
     }
     u32 ground_mask = 0;
@@ -117,59 +116,69 @@ const char* BlockedAerialEvade(u64 aggregator, u64 event) {
 }
 
 u32 PS4_SYSV_ABI Graph(void* graph, void* event) {
-    const auto caller = reinterpret_cast<u64>(__builtin_return_address(0)) - guest_base;
     const auto addr = reinterpret_cast<u64>(graph);
     const auto ev = reinterpret_cast<u64>(event);
-    if (!installed || caller != 0xa1fb69 || ev == 0 || compat.pawn == 0 ||
-        pending_gate_flag != nullptr || (LiveDword(addr + 0x90) & 1) == 0 ||
-        CompatWord(addr + 0x88) != 0) {
+    if (evade_press == nullptr || evade_press->event != ev || addr != angel_buffer.graph ||
+        pending_gate_flag != nullptr ||
+        reinterpret_cast<u64>(__builtin_return_address(0)) - guest_base != 0xa1fb69 ||
+        LiveWord(addr + 0x78) != evade_press->aggregator) {
         return graph_event(graph, event);
     }
-    const u64 aggregator = CompatWord(addr + 0x78);
-    u8 type = 255;
-    if (aggregator == 0 || aggregator != CompatWord(compat.pawn + 0x930) ||
-        !CompatName(CompatWord(ev + 0x60), "DVButton_Evade") ||
-        !CompatRead(ev + 0x78, &type, sizeof(type)) || type != 0 || !IsInput(ev) ||
-        !IsEvadeRoot(addr)) {
+    if ((LiveDword(addr + 0x90) & 1) == 0 || LiveWord(addr + 0x88) != 0) {
+        evade_press->outcome = "angel graph awake or has active node";
         return graph_event(graph, event);
     }
-    if (const char* blocked = BlockedAerialEvade(aggregator, ev)) {
-        Record("early_aerial_evade skipped: {}", blocked);
+    if (const char* blocked = BlockedAerialEvade(*evade_press)) {
+        evade_press->outcome = blocked;
         return graph_event(graph, event);
     }
 
     pending_gate_event = ev;
     pending_gate_flag = reinterpret_cast<u8*>(addr + 0x90);
     *pending_gate_flag &= 0xfe;
-    const auto start = std::chrono::steady_clock::now();
     const u32 accepted = graph_event(graph, event);
     const bool checked_conditions = pending_gate_flag == nullptr;
     RestoreBufferingGate();
     pending_gate_event = 0;
-    if (diagnostic_lines < 48) {
-        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - start)
-                            .count();
-        Record("early_aerial_evade accepted={} native_root_checked={} elapsed_us={}", accepted,
-               checked_conditions, us);
-    }
+    auto& outcome = evade_press->outcome;
+    outcome = accepted             ? "native accepted"
+              : checked_conditions ? "native declined"
+                                   : "root not evaluated";
     return accepted;
 }
 
+bool IsAngelEvadeOwner(u64 owner) {
+    const auto name = static_cast<u32>(owner);
+    return CompatNameIndex(name, "Action_AngelEvade_Ground") ||
+           CompatNameIndex(name, "Action_AngelEvade_Ground_3rd") ||
+           CompatNameIndex(name, "Action_AngelEvade_Air") ||
+           CompatNameIndex(name, "Action_AngelEvade_Air_3rd");
+}
+
+void PS4_SYSV_ABI SetBuffer(void* graph, void* frame, void* result) {
+    set_buffer(graph, frame, result);
+    if (creating_buffer != nullptr && compat.pawn != 0) {
+        const auto address = reinterpret_cast<u64>(graph);
+        if (LiveWord(address + 0x78) == CompatWord(compat.pawn + 0x930)) {
+            creating_buffer->graph = address;
+        }
+    }
+}
+
 void PS4_SYSV_ABI Create(void* manager, u64 token, u64 owner) {
-    create_token(manager, token, owner);
     const auto address = reinterpret_cast<u64>(manager);
     if (!installed || compat.pawn == 0 ||
         !CompatNameIndex(static_cast<u32>(token), "EvadesBuffer") ||
-        address != CompatWord(compat.pawn + 0x9c0)) {
-        return;
+        address != CompatWord(compat.pawn + 0x9c0) || !IsAngelEvadeOwner(owner)) {
+        return create_token(manager, token, owner);
     }
-    const auto owner_name = static_cast<u32>(owner);
-    if (CompatNameIndex(owner_name, "Action_AngelEvade_Ground") ||
-        CompatNameIndex(owner_name, "Action_AngelEvade_Ground_3rd") ||
-        CompatNameIndex(owner_name, "Action_AngelEvade_Air") ||
-        CompatNameIndex(owner_name, "Action_AngelEvade_Air_3rd")) {
-        angel_buffer = {address, token, owner};
+    AngelEvadeBuffer buffer{address, token, owner};
+    auto* previous = creating_buffer;
+    creating_buffer = &buffer;
+    create_token(manager, token, owner);
+    creating_buffer = previous;
+    if (buffer.graph != 0) {
+        angel_buffer = buffer;
     }
 }
 
@@ -180,6 +189,29 @@ void PS4_SYSV_ABI Delete(void* manager, u64 token, u64 owner) {
         angel_buffer = {};
     }
     delete_token(manager, token, owner);
+}
+
+u32 Aggregate(void* object, void* input_event, u32 input, u32 (*original)(void*, void*, u32)) {
+    const auto aggregator = reinterpret_cast<u64>(object);
+    const auto event = reinterpret_cast<u64>(input_event);
+    u8 mode = 255;
+    if (!installed || input == 0 || event == 0 || compat.pawn == 0 ||
+        *reinterpret_cast<const u8*>(event + 0x78) != 0 ||
+        !CompatName(LiveWord(event + 0x60), "DVButton_Evade") || !IsInput(event) ||
+        aggregator != CompatWord(compat.pawn + 0x930) ||
+        !CompatRead(event + 0x90, &mode, sizeof(mode)) || mode > 1) {
+        return original(object, input_event, input);
+    }
+    EvadePress press{aggregator, event, mode};
+    auto* previous = evade_press;
+    evade_press = &press;
+    const u32 accepted = original(object, input_event, input);
+    evade_press = previous;
+    if (diagnostic_lines < 48) {
+        Record("press mode={} {} graph_known={} aggregate_accepted={} buffered={}", mode,
+               press.outcome, angel_buffer.graph != 0, accepted, LiveDword(aggregator + 0x80));
+    }
+    return accepted;
 }
 
 void Install(u64 base);

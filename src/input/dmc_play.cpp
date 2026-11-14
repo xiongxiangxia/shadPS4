@@ -929,8 +929,15 @@ void* PS4_SYSV_ABI Select(void* set, void* event) {
     return compat_enabled ? CompatSelect(set, event) : native_select_link(set, event);
 }
 u32 PS4_SYSV_ABI Aggregate(void* object, void* event, u32 input) {
+#ifdef ENABLE_DMC_EVADE_TRACE
+    return EvadeTrace::Aggregate(object, event, input, [](void* aggregator, void* press, u32 type) {
+        return compat_enabled ? CompatAggregate(aggregator, press, type)
+                              : native_aggregate_event(aggregator, press, type);
+    });
+#else
     return compat_enabled ? CompatAggregate(object, event, input)
                           : native_aggregate_event(object, event, input);
+#endif
 }
 
 void AbsoluteJump(u8* output, u64 target) {
@@ -1000,7 +1007,12 @@ void EvadeTrace::Install(u64 base) {
         NativeEntry(base + 0xa2d540, reinterpret_cast<u64>(&Create), token_bytes));
     delete_token = reinterpret_cast<TokenOperation>(
         NativeEntry(base + 0xa2d780, reinterpret_cast<u64>(&Delete), token_bytes));
-    installed = graph_event && create_token && delete_token;
+    constexpr std::array<u8, 19> callback_bytes{
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48,
+        0x83, 0xec, 0x18, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe};
+    set_buffer = reinterpret_cast<BufferCallback>(
+        NativeEntry(base + 0x20b7fe0, reinterpret_cast<u64>(&SetBuffer), callback_bytes));
+    installed = graph_event && create_token && delete_token && set_buffer;
     LOG_INFO(Input, "[DMC EVADE] Air evade experiment installed={}", installed);
 }
 #endif
