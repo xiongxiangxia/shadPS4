@@ -714,9 +714,6 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
     }
 #endif
     native_condition_dispatch(object, function, parameters, result);
-#ifdef ENABLE_DMC_EVADE_TRACE
-    EvadeTrace::Condition(address, parameters, caller);
-#endif
 
     const bool graph_condition = caller == guest_base + 0xa1fee9;
     const bool selection_condition =
@@ -926,37 +923,15 @@ void PS4_SYSV_ABI Dispatch(void* object, void* function, void* parameters, void*
                    reinterpret_cast<u64>(__builtin_return_address(0)));
 }
 u32 PS4_SYSV_ABI Match(void* definition, void* event) {
-    const u32 matched =
-        compat_enabled ? CompatMatch(definition, event) : native_match_event(definition, event);
-#ifdef ENABLE_DMC_EVADE_TRACE
-    EvadeTrace::Match(reinterpret_cast<u64>(definition), reinterpret_cast<u64>(event), matched);
-#endif
-    return matched;
+    return compat_enabled ? CompatMatch(definition, event) : native_match_event(definition, event);
 }
 void* PS4_SYSV_ABI Select(void* set, void* event) {
     return compat_enabled ? CompatSelect(set, event) : native_select_link(set, event);
 }
 u32 PS4_SYSV_ABI Aggregate(void* object, void* event, u32 input) {
-#ifdef ENABLE_DMC_EVADE_TRACE
-    EvadeTrace::Input(reinterpret_cast<u64>(object), reinterpret_cast<u64>(event), input);
-#endif
     return compat_enabled ? CompatAggregate(object, event, input)
                           : native_aggregate_event(object, event, input);
 }
-
-#ifdef ENABLE_DMC_EVADE_TRACE
-u32 PS4_SYSV_ABI TraceBuffer(void* buffer, void* owner, void* event, void* first, void* second) {
-    const auto address = reinterpret_cast<u64>(buffer);
-    const auto ev = reinterpret_cast<u64>(event);
-    const char* button = EvadeTrace::BufferButton(address, ev);
-    const u32 accepted = CompatBuffer(buffer, owner, event, first, second);
-    if (button != nullptr) {
-        EvadeTrace::Record("buffer button={} event={:#x} accepted={} count={}", button, ev,
-                           accepted, LiveDword(address + 8));
-    }
-    return accepted;
-}
-#endif
 
 void AbsoluteJump(u8* output, u64 target) {
     constexpr std::array<u8, 6> instruction{0xff, 0x25, 0, 0, 0, 0};
@@ -1009,8 +984,6 @@ void EvadeTrace::Install(u64 base) {
                                              0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
     auto token_bytes = graph_bytes;
     token_bytes.back() = 0x28;
-    constexpr std::array<u8, 16> start_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
-                                             0x53, 0x48, 0x83, 0xec, 0x18, 0x49, 0x89, 0xff};
     if (!compat_enabled) {
         LOG_ERROR(Input, "[DMC EVADE] Trace needs the validated DmC play hooks");
         return;
@@ -1027,11 +1000,8 @@ void EvadeTrace::Install(u64 base) {
         NativeEntry(base + 0xa2d540, reinterpret_cast<u64>(&Create), token_bytes));
     delete_token = reinterpret_cast<TokenOperation>(
         NativeEntry(base + 0xa2d780, reinterpret_cast<u64>(&Delete), token_bytes));
-    action_start = reinterpret_cast<ActionStart>(
-        NativeEntry(base + 0xa17f00, reinterpret_cast<u64>(&Start), start_bytes));
-    installed = graph_event && create_token && delete_token && action_start;
-    LOG_INFO(Input, "[DMC EVADE] Trace installed={}; auto capture after evade, up to 384 lines",
-             installed);
+    installed = graph_event && create_token && delete_token;
+    LOG_INFO(Input, "[DMC EVADE] Air evade experiment installed={}", installed);
 }
 #endif
 
@@ -1086,13 +1056,8 @@ void Install() {
 
     native_aggregate_event = reinterpret_cast<AggregateEvent>(
         NativeEntry(base + 0xa1f980, reinterpret_cast<u64>(&Aggregate), compat_let_bytes));
-#ifdef ENABLE_DMC_EVADE_TRACE
-    const auto buffer_hook = &TraceBuffer;
-#else
-    const auto buffer_hook = &CompatBuffer;
-#endif
     native_buffer_event = reinterpret_cast<BufferEvent>(
-        NativeEntry(base + 0xa1c3c0, reinterpret_cast<u64>(buffer_hook), compat_let_bytes));
+        NativeEntry(base + 0xa1c3c0, reinterpret_cast<u64>(&CompatBuffer), compat_let_bytes));
     compat_bool = reinterpret_cast<Native>(
         NativeEntry(base + 0x55b90, reinterpret_cast<u64>(&CompatBool), bool_bytes));
     original.store(reinterpret_cast<Native>(NativeEntry(
