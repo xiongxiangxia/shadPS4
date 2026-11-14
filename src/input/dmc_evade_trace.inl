@@ -22,8 +22,25 @@ struct Capture {
 };
 thread_local Capture capture;
 
+struct HumanEvadeAttempt {
+    u64 graph = 0;
+    u64 pawn = 0;
+    u64 token = 0;
+    u64 owner = 0;
+};
+thread_local HumanEvadeAttempt human_evade;
+thread_local u64 pending_gate_event = 0;
+thread_local u8* pending_gate_flag = nullptr;
+
+void RestoreBufferingGate() {
+    if (pending_gate_flag != nullptr) {
+        *pending_gate_flag |= 1;
+        pending_gate_flag = nullptr;
+    }
+}
+
 bool Active() {
-    return installed && capture.start != Clock::time_point{} && capture.lines < 384 &&
+    return installed && capture.start != Clock::time_point{} &&
            Clock::now() - capture.start < std::chrono::seconds{5};
 }
 
@@ -130,6 +147,28 @@ bool IsInput(u64 event) {
     return false;
 }
 
+bool CanTryHumanEvade(u64 graph, u64 event, u64 caller) {
+    if (caller != 0xa1fb69 || graph != human_evade.graph || compat.pawn != human_evade.pawn ||
+        human_evade.token == 0 || pending_gate_flag != nullptr || CompatWord(graph + 0x88) != 0 ||
+        (LiveDword(graph + 0x90) & 1) == 0 || LiveDword(capture.aggregator + 0x80) != 0 ||
+        compat.mode_offset == 0) {
+        return false;
+    }
+    u8 mode = 255;
+    u8 event_mode = 255;
+    if (!CompatRead(compat.pawn + compat.mode_offset, &mode, sizeof(mode)) || mode != 0 ||
+        !CompatRead(event + 0x90, &event_mode, sizeof(event_mode)) || event_mode != 0) {
+        return false;
+    }
+    const u64 conditions = CompatWord(graph + 0x68);
+    const u64 list = conditions != 0 ? CompatWord(conditions + 0x68) : 0;
+    const u64 first = list != 0 ? CompatWord(list) : 0;
+    return first != 0 && LiveDword(conditions + 0x70) != 0 &&
+           CompatName(CompatWord(first + 0x40), "EvadeGraphRoot") &&
+           CompatClass(first, "DVActionGraph_ConditionDef_Token") &&
+           TokenCount(CompatWord(compat.pawn + 0x9c0), human_evade.token) == 1;
+}
+
 void Input(u64 aggregator, u64 event, u32 input) {
     if (!installed || input == 0 || event == 0 || compat.pawn == 0 ||
         aggregator != CompatWord(compat.pawn + 0x930)) {
@@ -144,7 +183,7 @@ void Input(u64 aggregator, u64 event, u32 input) {
         return;
     }
     if (!Active()) {
-        if (std::strcmp(button, "Evade") != 0 || capture.lines >= 384) {
+        if (std::strcmp(button, "Evade") != 0) {
             return;
         }
         capture.start = Clock::now();
@@ -180,9 +219,22 @@ u32 PS4_SYSV_ABI Graph(void* graph, void* event) {
     const auto previous_event = capture.event;
     capture.event = ev;
     const auto root = ObjectName(CompatWord(addr + 0x60));
-    Record("graph_enter button={} event={:#x} graph={:#x} root={} caller={:#x} node={:#x}", button,
-           ev, addr, root.data(), caller, before);
+    Record(
+        "graph_enter button={} event={:#x} graph={:#x} root={} caller={:#x} node={:#x} flags={:#x}",
+        button, ev, addr, root.data(), caller, before, LiveDword(addr + 0x90));
+    const bool early = std::strcmp(button, "Evade") == 0 && CanTryHumanEvade(addr, ev, caller);
+    if (early) {
+        Record("early_human_evade begin event={:#x}", ev);
+        pending_gate_event = ev;
+        pending_gate_flag = reinterpret_cast<u8*>(addr + 0x90);
+        *pending_gate_flag &= 0xfe;
+    }
     const u32 accepted = graph_event(graph, event);
+    if (early) {
+        RestoreBufferingGate();
+        pending_gate_event = 0;
+        Record("early_human_evade end event={:#x} accepted={}", ev, accepted);
+    }
     Record("graph_exit event={:#x} accepted={} node={:#x} buffered={}", ev, accepted,
            CompatWord(addr + 0x88), LiveDword(capture.aggregator + 0x80));
     capture.event = previous_event;
@@ -243,8 +295,23 @@ void Token(const char* operation, u64 manager, u64 token, u64 owner, u64 caller)
     }
     const auto name = Name(token);
     const auto owner_name = Name(owner);
+    const s32 count = TokenCount(manager, token);
+    if (std::strcmp(operation, "delete") == 0 && token == human_evade.token &&
+        (count == 0 || owner == human_evade.owner)) {
+        human_evade.token = 0;
+        human_evade.owner = 0;
+    }
+    if (std::strcmp(operation, "create") == 0 && human_evade.pawn == compat.pawn && count == 1 &&
+        std::strcmp(name.data(), "EvadesBuffer") == 0 &&
+        (std::strcmp(owner_name.data(), "Action_AngelEvade_Ground") == 0 ||
+         std::strcmp(owner_name.data(), "Action_AngelEvade_Ground_3rd") == 0 ||
+         std::strcmp(owner_name.data(), "Action_AngelEvade_Air") == 0 ||
+         std::strcmp(owner_name.data(), "Action_AngelEvade_Air_3rd") == 0)) {
+        human_evade.token = token;
+        human_evade.owner = owner;
+    }
     Record("token {} name={} owner={} count_after={} caller={:#x}", operation, name.data(),
-           owner_name.data(), TokenCount(manager, token), caller - guest_base);
+           owner_name.data(), count, caller - guest_base);
 }
 
 void PS4_SYSV_ABI Create(void* manager, u64 token, u64 owner) {
@@ -269,6 +336,11 @@ void PS4_SYSV_ABI Start(void* action) {
              CompatClass(address, "DVAction_Dante_AngelEvade"))) {
             const auto type = ObjectName(CompatWord(address + 0x50));
             const auto root = ObjectName(CompatWord(graph + 0x60));
+            if (CompatClass(address, "DVAction_Dante_AngelEvade")) {
+                human_evade = {graph, compat.pawn};
+            } else if (graph == human_evade.graph) {
+                human_evade = {};
+            }
             Record("action_start graph={} class={} action={:#x} node={:#x}", root.data(),
                    type.data(), address, node);
         }
