@@ -81,13 +81,12 @@ bool IsInput(u64 event) {
 
 bool IsEvadeRoot(u64 graph) {
     const u64 conditions = CompatWord(graph + 0x68);
-    if (conditions == 0 || !CompatName(CompatWord(conditions + 0x60), "EvadeGraphRoot") ||
-        LiveDword(conditions + 0x70) == 0) {
+    if (conditions == 0 || LiveDword(conditions + 0x70) == 0) {
         return false;
     }
     const u64 list = CompatWord(conditions + 0x68);
     const u64 first = list != 0 ? CompatWord(list) : 0;
-    return first != 0 &&
+    return first != 0 && CompatName(CompatWord(first + 0x40), "EvadeGraphRoot") &&
            CompatNameIndex(static_cast<u32>(CompatWord(first + 0x60)), "EvadesDenied");
 }
 
