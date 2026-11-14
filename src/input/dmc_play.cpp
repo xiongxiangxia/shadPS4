@@ -347,14 +347,25 @@ u64 CompatWord(u64 address) {
     return value;
 }
 
-u32 CompatOffset(u64 object, const char* name) {
+u32 CompatOffset(u64 object, const char* name, u32* bool_mask = nullptr) {
+    if (bool_mask != nullptr) {
+        *bool_mask = 0;
+    }
     if (object == 0) {
         return 0;
     }
-    thread_local std::unordered_map<CompatLookup, u32, CompatLookupHash> offsets;
+    struct Field {
+        u32 offset = 0;
+        u64 property = 0;
+    };
+    thread_local std::unordered_map<CompatLookup, Field, CompatLookupHash> offsets;
     const CompatLookup key{CompatWord(object + 0x50), name};
     if (const auto found = offsets.find(key); found != offsets.end()) {
-        return found->second;
+        const auto& field = found->second;
+        if (bool_mask != nullptr && field.property != 0) {
+            CompatRead(field.property + 0x94, bool_mask, sizeof(*bool_mask));
+        }
+        return field.offset;
     }
     CompatMetadataReader metadata;
     metadata.metadata_scan = true;
@@ -373,15 +384,18 @@ u32 CompatOffset(u64 object, const char* name) {
                 u32 offset = 0;
                 if (metadata.Copy(field + 0x90, &offset, sizeof(offset)) && offset >= 0x58 &&
                     offset < 0x10000) {
-                    offsets.emplace(key, offset);
+                    offsets.emplace(key, Field{offset, field});
+                    if (bool_mask != nullptr) {
+                        CompatRead(field + 0x94, bool_mask, sizeof(*bool_mask));
+                    }
                     return offset;
                 }
-                offsets.emplace(key, 0);
+                offsets.emplace(key, Field{});
                 return 0;
             }
         }
     }
-    offsets.emplace(key, 0);
+    offsets.emplace(key, Field{});
     return 0;
 }
 
