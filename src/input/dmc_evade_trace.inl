@@ -26,28 +26,16 @@ struct EvadePress {
     u64 aggregator;
     u64 event;
     u8 mode;
-    const char* outcome = "angel buffer graph not reached";
-    bool reached_selector = false;
-    bool skipped_buffer_check = false;
 };
 
 thread_local EvadePress* evade_press = nullptr;
 thread_local u64 pending_gate_event = 0;
 thread_local u8* pending_gate_flag = nullptr;
-thread_local u32 diagnostic_lines = 0;
 
 void RestoreBufferingGate() {
     if (pending_gate_flag != nullptr) {
         *pending_gate_flag |= 1;
         pending_gate_flag = nullptr;
-    }
-}
-
-template <typename... Args>
-void Record(fmt::format_string<Args...> format, Args&&... args) {
-    if (diagnostic_lines < 48) {
-        ++diagnostic_lines;
-        LOG_INFO(Input, "[DMC EVADE] {}", fmt::format(format, std::forward<Args>(args)...));
     }
 }
 
@@ -127,11 +115,9 @@ u32 PS4_SYSV_ABI Graph(void* graph, void* event) {
         return graph_event(graph, event);
     }
     if ((LiveDword(addr + 0x90) & 1) == 0 || LiveWord(addr + 0x88) != 0) {
-        evade_press->outcome = "angel graph awake or has active node";
         return graph_event(graph, event);
     }
-    if (const char* blocked = BlockedAerialEvade(*evade_press)) {
-        evade_press->outcome = blocked;
+    if (BlockedAerialEvade(*evade_press) != nullptr) {
         return graph_event(graph, event);
     }
 
@@ -141,7 +127,6 @@ u32 PS4_SYSV_ABI Graph(void* graph, void* event) {
     const u32 accepted = graph_event(graph, event);
     RestoreBufferingGate();
     pending_gate_event = 0;
-    evade_press->outcome = accepted ? "native accepted" : "native declined";
     return accepted;
 }
 
@@ -181,7 +166,6 @@ bool DispatchRootCondition(void* object, void* function, void* parameters, void*
     std::memcpy(count_field, &empty, sizeof(empty));
     native_condition_dispatch(object, function, parameters, result);
     std::memcpy(count_field, &count, sizeof(count));
-    evade_press->skipped_buffer_check = true;
     return true;
 }
 
@@ -189,7 +173,6 @@ void BeforeSelect(void* event, u64 caller) {
     if (pending_gate_event != 0 && reinterpret_cast<u64>(event) == pending_gate_event &&
         caller == guest_base + 0xa1ffcb) {
         RestoreBufferingGate();
-        evade_press->reached_selector = true;
     }
 }
 
@@ -253,12 +236,6 @@ u32 Aggregate(void* object, void* input_event, u32 input, u32 (*original)(void*,
     evade_press = &press;
     const u32 accepted = original(object, input_event, input);
     evade_press = previous;
-    if (diagnostic_lines < 48) {
-        Record("press mode={} {} graph_known={} skipped_buffer_check={} selector={} "
-               "aggregate_accepted={} buffered={}",
-               mode, press.outcome, angel_buffer.graph != 0, press.skipped_buffer_check,
-               press.reached_selector, accepted, LiveDword(aggregator + 0x80));
-    }
     return accepted;
 }
 

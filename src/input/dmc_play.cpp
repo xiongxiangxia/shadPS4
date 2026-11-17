@@ -13,10 +13,6 @@
 #include <limits>
 #include <unordered_map>
 #include <windows.h>
-#ifdef ENABLE_DMC_EVADE_TRACE
-#include <utility>
-#include <fmt/format.h>
-#endif
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
@@ -1014,7 +1010,6 @@ void EvadeTrace::Install(u64 base) {
     set_buffer = reinterpret_cast<BufferCallback>(
         NativeEntry(base + 0x20b7fe0, reinterpret_cast<u64>(&SetBuffer), callback_bytes));
     installed = graph_event && create_token && delete_token && set_buffer;
-    LOG_INFO(Input, "[DMC EVADE] Air evade experiment installed={}", installed);
 }
 #endif
 
