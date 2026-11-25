@@ -23,3 +23,8 @@ Builds on charge compatibility and 3x camera to investigate delayed human or dem
 **Usage:** Download the Windows artifact from the corresponding GitHub Actions run, extract it, back up the existing shadPS4.exe, and replace it. Keep the existing game data, configuration, and other installation files. Verify behavior in game.
 
 **Known limitations:** These are DmC-specific compatibility adjustments. The underlying emulator cause of the input problems is still unconfirmed. Some input and action timing issues may remain.
+
+## 实现文档 / Implementation documents
+
+- [空闪实验与诊断 / Aerial evade experiment](documents/DMC-EVADE-TRACE.md)
+- [蓄枪基线 / Charge baseline](documents/DMC-PLAY.md)
