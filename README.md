@@ -23,3 +23,8 @@ Contains charge compatibility and 3x manual camera speed. The charge patch track
 **Usage:** Download the Windows artifact from the corresponding GitHub Actions run, extract it, back up the existing shadPS4.exe, and replace it. Keep the existing game data, configuration, and other installation files. Verify behavior in game.
 
 **Known limitations:** These are DmC-specific compatibility adjustments. The underlying emulator cause of the input problems is still unconfirmed. Some input and action timing issues may remain.
+
+## 实现文档 / Implementation documents
+
+- [蓄枪和纯游玩版说明 / Charge and play edition](documents/DMC-PLAY.md)
+- [镜头实现说明（早期 2.5 倍实验） / Camera implementation (earlier 2.5x experiment)](documents/DMC-CAMERA.md)
