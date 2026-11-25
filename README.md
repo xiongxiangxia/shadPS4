@@ -23,3 +23,8 @@ Investigates input sampling, held-fire requests, action transitions, and charge 
 **Usage:** Download the Windows artifact from the corresponding GitHub Actions run, extract it, back up the existing shadPS4.exe, and replace it. Keep the existing game data, configuration, and other installation files. Verify behavior in game.
 
 **Known limitations:** These are DmC-specific compatibility adjustments. The underlying emulator cause of the input problems is still unconfirmed. Some input and action timing issues may remain.
+
+## 实现文档 / Implementation documents
+
+- [蓄枪实验与诊断记录 / Charge experiments and diagnostics](documents/DMC-editions.md)
+- [轻量诊断说明 / Lightweight diagnostics](documents/DMC-LIGHT-capture.md)
