@@ -25,3 +25,9 @@ Includes charge compatibility, 3x manual camera speed, and an aerial human/demon
 **Known limitations:** These are DmC-specific compatibility adjustments. The underlying emulator cause of the input problems is still unconfirmed. Some input and action timing issues may remain.
 
 [Download the 3x Windows play build / 下载 3 倍 Windows 游玩版](https://github.com/xiongxiangxia/shadPS4/actions/runs/44106541152)
+
+## 实现文档 / Implementation documents
+
+- [当前游玩版实现 / Current gameplay implementation](documents/DMC-PLAY-AIR-EVADE.md)
+- [蓄枪基线历史 / Charge baseline history](documents/DMC-PLAY.md)
+- [镜头实现历史（2.5 倍实验） / Camera implementation history (2.5x experiment)](documents/DMC-CAMERA.md)
