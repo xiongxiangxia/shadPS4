@@ -17,7 +17,7 @@ concurrency:
 jobs:
   windows:
     name: Windows play camera ${{ matrix.label }}
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:

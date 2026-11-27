@@ -414,6 +414,7 @@ enum TrainerFlag : u32 {
     FreezeTimer = 1u << 4,
 };
 std::atomic<u32> trainer_flags{0};
+std::atomic<u64> trainer_resource_generation{0};
 
 void RefillTrainerValue(u64 object, u32 current, const char* maximum) {
     if (object == 0 || current == 0) {
@@ -685,12 +686,17 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
         return compat_bool(object, frame, result);
     }
     const u32 flags = trainer_flags.load(std::memory_order_relaxed);
-    if ((flags & (DenyAttacks | FreezeTimer)) != 0) {
+    if ((flags & (DenyAttacks | FreezeTimer | FullResources)) != 0) {
         const u64 address = reinterpret_cast<u64>(object);
         if (((flags & DenyAttacks) != 0 && CompatName(property, "m_GlobalAttackDenial") &&
              CompatClass(address, "DVAICoordinator")) ||
             ((flags & FreezeTimer) != 0 && CompatName(property, "m_Paused") &&
-             CompatClass(address, "DVSeqAct_Timer"))) {
+             CompatClass(address, "DVSeqAct_Timer")) ||
+            ((flags & FullResources) != 0 && CompatName(property, "m_bCheatInfinitePoints") &&
+             CompatClass(address, "DVTriggerComponent") &&
+             CompatObject(compat.pawn, "m_TriggerComponent") == address) ||
+            ((flags & FullResources) != 0 && CompatName(property, "bGodMode") &&
+             address == compat.controller)) {
             compat_bool(object, frame, result);
             const u32 enabled = 1;
             std::memcpy(result, &enabled, sizeof(enabled));
@@ -719,7 +725,14 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     compat_bool(object, frame, result);
     CompatController(reinterpret_cast<u64>(object));
     if ((trainer_flags.load(std::memory_order_relaxed) & FullResources) != 0) {
-        RefillTrainerResources();
+        static thread_local u64 last_generation = 0;
+        static thread_local u64 last_pawn = 0;
+        const u64 generation = trainer_resource_generation.load(std::memory_order_relaxed);
+        if (generation != last_generation || compat.pawn != last_pawn) {
+            RefillTrainerResources();
+            last_generation = generation;
+            last_pawn = compat.pawn;
+        }
     }
     CompatModeIntent();
 
@@ -1089,9 +1102,9 @@ void EvadeTrace::Install(u64 base) {
         NativeEntry(base + 0xa2d540, reinterpret_cast<u64>(&Create), token_bytes));
     delete_token = reinterpret_cast<TokenOperation>(
         NativeEntry(base + 0xa2d780, reinterpret_cast<u64>(&Delete), token_bytes));
-    constexpr std::array<u8, 19> callback_bytes{
-        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48,
-        0x83, 0xec, 0x18, 0x48, 0x89, 0xf3, 0x49, 0x89, 0xfe};
+    constexpr std::array<u8, 19> callback_bytes{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                                0x56, 0x53, 0x48, 0x83, 0xec, 0x18, 0x48,
+                                                0x89, 0xf3, 0x49, 0x89, 0xfe};
     set_buffer = reinterpret_cast<BufferCallback>(
         NativeEntry(base + 0x20b7fe0, reinterpret_cast<u64>(&SetBuffer), callback_bytes));
     installed = graph_event && create_token && delete_token && set_buffer;
@@ -1106,6 +1119,9 @@ bool ToggleTrainer(unsigned key) {
     }
     const u32 bit = 1u << (key - 1);
     const u32 previous = trainer_flags.fetch_xor(bit, std::memory_order_relaxed);
+    if (key == 4 && (previous & bit) == 0) {
+        trainer_resource_generation.fetch_add(1, std::memory_order_relaxed);
+    }
     LOG_INFO(Input, "[DMC TRAINER] Key {} {}", key, (previous & bit) == 0 ? "on" : "off");
     return true;
 }
