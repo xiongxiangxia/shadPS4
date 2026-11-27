@@ -1,8 +1,8 @@
-name: DmC play 3x
+name: DmC trainer candidate
 
 on:
   push:
-    branches: [dmc-play-air-evade]
+    branches: [dmc-trainer]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: dmc-play-air-evade-${{ github.ref }}
+  group: dmc-trainer-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -43,9 +43,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path package -Force
           Copy-Item build\shadPS4.exe package\shadPS4.exe
-          'PLAY / camera=${{ matrix.label }} / ${{ github.sha }} / charge-base=dbb1bba7a1692420e6e7d3bff2a0e9f66937d797' | Out-File package\EDITION.txt
+          'TRAINER CANDIDATE / camera=${{ matrix.label }} / ${{ github.sha }} / charge-base=dbb1bba7a1692420e6e7d3bff2a0e9f66937d797' | Out-File package\EDITION.txt
           Get-FileHash package\shadPS4.exe -Algorithm SHA256 | Format-List | Out-File package\SHA256.txt
       - uses: actions/upload-artifact@v7
         with:
-          name: shadPS4-DMC-PLAY-CAMERA-${{ matrix.label }}-windows-${{ github.sha }}
+          name: shadPS4-DMC-TRAINER-CAMERA-${{ matrix.label }}-windows-${{ github.sha }}
           path: package/

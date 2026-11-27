@@ -5,4 +5,5 @@
 
 namespace Input::DmcPlay {
 void Install();
+bool ToggleTrainer(unsigned key);
 }

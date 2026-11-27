@@ -406,6 +406,39 @@ bool CompatHeld() {
            (buttons & (1u << 6)) != 0;
 }
 
+enum TrainerFlag : u32 {
+    ZeroDamage = 1u << 0,
+    OneHitKill = 1u << 1,
+    DenyAttacks = 1u << 2,
+    FullResources = 1u << 3,
+    FreezeTimer = 1u << 4,
+};
+std::atomic<u32> trainer_flags{0};
+
+void RefillTrainerValue(u64 object, u32 current, const char* maximum) {
+    if (object == 0 || current == 0) {
+        return;
+    }
+    const u32 max_offset = CompatOffset(object, maximum);
+    float value = 0;
+    if (max_offset != 0 && CompatRead(object + max_offset, &value, sizeof(value)) && value > 0.0f) {
+        std::memcpy(reinterpret_cast<void*>(object + current), &value, sizeof(value));
+    }
+}
+
+void RefillTrainerResources() {
+    float health = 0;
+    if (compat.pawn == 0 || compat.health_offset == 0 ||
+        !CompatRead(compat.pawn + compat.health_offset, &health, sizeof(health)) ||
+        !(health > 0.0f)) {
+        return;
+    }
+    RefillTrainerValue(compat.pawn, compat.health_offset, "m_MaxHealth");
+    const u64 trigger = CompatObject(compat.pawn, "m_TriggerComponent");
+    RefillTrainerValue(trigger, CompatOffset(trigger, "m_CurrentTriggerPoints"),
+                       "m_MaxTriggerPoints");
+}
+
 void CompatController(u64 object) {
     const u64 type = CompatWord(object + 0x50);
     if (compat.controller_class != type) {
@@ -651,6 +684,19 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     if (property == 0 || result == nullptr) {
         return compat_bool(object, frame, result);
     }
+    const u32 flags = trainer_flags.load(std::memory_order_relaxed);
+    if ((flags & (DenyAttacks | FreezeTimer)) != 0) {
+        const u64 address = reinterpret_cast<u64>(object);
+        if (((flags & DenyAttacks) != 0 && CompatName(property, "m_GlobalAttackDenial") &&
+             CompatClass(address, "DVAICoordinator")) ||
+            ((flags & FreezeTimer) != 0 && CompatName(property, "m_Paused") &&
+             CompatClass(address, "DVSeqAct_Timer"))) {
+            compat_bool(object, frame, result);
+            const u32 enabled = 1;
+            std::memcpy(result, &enabled, sizeof(enabled));
+            return;
+        }
+    }
     u64 consumed_property = compat_consumed_property.load(std::memory_order_acquire);
     if (consumed_property == 0) {
         const u64 function = LiveWord(reinterpret_cast<u64>(frame) + 0x18);
@@ -672,6 +718,9 @@ void PS4_SYSV_ABI CompatBool(void* object, void* frame, void* result) {
     }
     compat_bool(object, frame, result);
     CompatController(reinterpret_cast<u64>(object));
+    if ((trainer_flags.load(std::memory_order_relaxed) & FullResources) != 0) {
+        RefillTrainerResources();
+    }
     CompatModeIntent();
 
     if (compat.gun == CompatGun::None) {
@@ -753,11 +802,47 @@ void CompatDispatch(void* object, void* function, void* parameters, void* result
     }
 }
 
+bool TrainerHealthAssignment(void* object, void* frame, void* result, u64 code, u32 flags) {
+    if ((flags & (ZeroDamage | OneHitKill | FullResources)) == 0 ||
+        *reinterpret_cast<const u8*>(code) != 0x01 ||
+        !CompatFunction(LiveWord(reinterpret_cast<u64>(frame) + 0x18), "SetHealth") ||
+        !CompatName(LiveWord(code + 1), "m_Health")) {
+        return false;
+    }
+    const u64 pawn = reinterpret_cast<u64>(object);
+    const u32 offset = CompatOffset(pawn, "m_Health");
+    float before = 0;
+    if (offset == 0 || !CompatRead(pawn + offset, &before, sizeof(before)) || !(before > 0.0f)) {
+        return false;
+    }
+    const bool player = pawn == compat.pawn || CompatClass(pawn, "DVPawn_Player");
+    const bool enemy =
+        !player && (CompatClass(pawn, "DVPawn_NormalEnemy") || CompatClass(pawn, "DVPawn_Boss"));
+    if (!player && !enemy) {
+        return false;
+    }
+    original.load(std::memory_order_acquire)(object, frame, result);
+    float after = 0;
+    if (CompatRead(pawn + offset, &after, sizeof(after)) && after < before) {
+        if ((flags & ZeroDamage) != 0 || (player && (flags & FullResources) != 0)) {
+            std::memcpy(reinterpret_cast<void*>(pawn + offset), &before, sizeof(before));
+        } else if (enemy && (flags & OneHitKill) != 0) {
+            const float zero = 0;
+            std::memcpy(reinterpret_cast<void*>(pawn + offset), &zero, sizeof(zero));
+        }
+    }
+    return true;
+}
+
 void PS4_SYSV_ABI CompatLet(void* object, void* frame, void* result) {
     if (!compat_enabled) {
         return original.load(std::memory_order_acquire)(object, frame, result);
     }
     const u64 code = Operand(frame);
+    const u32 flags = trainer_flags.load(std::memory_order_relaxed);
+    if (flags != 0 && TrainerHealthAssignment(object, frame, result, code, flags)) {
+        return;
+    }
     const u64 shot_site = compat_shot_site.load(std::memory_order_relaxed);
     if (shot_site != 0 && code != shot_site) {
         return original.load(std::memory_order_acquire)(object, frame, result);
@@ -1015,6 +1100,16 @@ void EvadeTrace::Install(u64 base) {
 
 } // namespace
 
+bool ToggleTrainer(unsigned key) {
+    if (!compat_enabled || key < 1 || key > 5) {
+        return false;
+    }
+    const u32 bit = 1u << (key - 1);
+    const u32 previous = trainer_flags.fetch_xor(bit, std::memory_order_relaxed);
+    LOG_INFO(Input, "[DMC TRAINER] Key {} {}", key, (previous & bit) == 0 ? "on" : "off");
+    return true;
+}
+
 void Install() {
     if (native_aggregate_event != nullptr ||
         Common::ElfInfo::Instance().GameSerial() != "CUSA01022" ||
@@ -1087,5 +1182,8 @@ void Install() {
 #else
 namespace Input::DmcPlay {
 void Install() {}
+bool ToggleTrainer(unsigned) {
+    return false;
+}
 } // namespace Input::DmcPlay
 #endif

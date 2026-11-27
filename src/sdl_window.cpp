@@ -25,6 +25,7 @@
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
+#include "input/dmc_play.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "sdl_window.h"
@@ -236,6 +237,12 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_MOUSE_WHEEL_OFF:
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+            event.key.scancode >= SDL_SCANCODE_KP_1 &&
+            event.key.scancode <= SDL_SCANCODE_KP_5 &&
+            Input::DmcPlay::ToggleTrainer(event.key.scancode - SDL_SCANCODE_KP_1 + 1)) {
+            break;
+        }
         OnKeyboardMouseInput(&event);
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
